@@ -129,7 +129,7 @@ card(478, 104, 330, 144, "Browser  ·  Alice", "opaque session cookie — never 
 
 # --- terminal ---------------------------------------------------------------
 card(830, 104, 330, 144, "Terminal", "the same system, scripted",
-     ["make verify   22 assertions", "make demo     5 scenarios", "curl + Bearer token"],
+     ["make verify   29 assertions", "make demo     6 scenarios", "curl + Bearer token"],
      mono_lines=True)
 
 # --- legend -----------------------------------------------------------------
@@ -188,7 +188,7 @@ apps = [
     (778, "smarthome-service", "sa/smarthome-service  ·  browser UI + API, third-party",
      "consent enforced — the azp claim is the only thing that differs", None),
     (891, "agent-runner",      "sa/agent-runner  ·  the agent",
-     "exchanges Alice's token for its own (RFC 8693), then acts — and is refused what she did not delegate", AGENT),
+     "RFC 8693 exchange: sub stays alice, azp becomes the agent — then it acts, bound by the delegation", AGENT),
     (1004, "device-service",   "sa/device-service  ·  device state + /telemetry ingest",
      "/internal/* callable only by smarthome-service and agent-runner; /telemetry only by the device", None),
 ]
@@ -200,9 +200,9 @@ for y, name, sub, note, accent in apps:
     text(APP_X + APP_W - 14, y + 48, ":8080   health :8081 not intercepted", 9.5, FAINT,
          anchor="end", family=MONO)
 
-text(106, 1160, "Every internal hop is authorized again at the callee's own sidecar — same three identities, a different question.",
+text(106, 1180, "Every internal hop is authorized again at the callee's own sidecar — the same identities, a different question.",
      11, NS["apps"]["label"])
-text(106, 1178, "A gateway-only architecture never gets to ask the second one.", 11, NS["apps"]["label"], opacity="0.75")
+text(106, 1198, "A gateway-only architecture never gets to ask the second one.", 11, NS["apps"]["label"], opacity="0.75")
 
 # -------------------------------------------------------------------- ns id --
 nsbox(1080, 508, 568, 712, "id", "ns id", "the identity and authorization plane · STRICT mTLS on account-app")
@@ -279,23 +279,23 @@ alabel(1075, 684, "Check", CHECK, size=11)
 alabel(1075, 672, "every request", CHECK, size=9.5)
 
 # --- internal service-to-service hops ---------------------------------------
-for a, b, rail in ((636, 688, 118), (824, 1028, 108), (812, 700, 130)):
-    path([(APP_X, a), (rail, a), (rail, b), (APP_X, b)], REQ, 1.8, dash="5 4")
-    e(f'<circle cx="{APP_X}" cy="{a}" r="3.2" fill="{REQ}"/>')
+# Blue: a service calling another service. Pink: the agent calling, with an
+# identity of its own and only the authority Alice delegated to it.
+hops = [
+    (800, 1060, 92,  REQ,   "smarthome-service → device-service"),
+    (940, 730,  104, AGENT, "agent-runner → profile-service"),
+    (830, 915,  116, REQ,   "smarthome-service → agent-runner"),
+    (602, 700,  128, REQ,   "profile-app → profile-service"),
+    (965, 1030, 140, AGENT, "agent-runner → device-service"),
+]
+for a, b, rail, colour, _ in hops:
+    path([(APP_X, a), (rail, a), (rail, b), (APP_X, b)], colour, 1.8, dash="5 4")
+    e(f'<circle cx="{APP_X}" cy="{a}" r="3.2" fill="{colour}"/>')
 
-# --- the agent: exchange, then act under delegation --------------------------
-# smarthome-service hands the task to the agent...
-path([(APP_X, 836), (96, 836), (96, 920), (APP_X, 920)], REQ, 1.8, dash="5 4")
-e(f'<circle cx="{APP_X}" cy="836" r="3.2" fill="{REQ}"/>')
-# ...the agent trades Alice's token for one of its own...
-path([(APP_X + 300, 891), (APP_X + 300, 860)], AGENT, 2.2, marker=False)
-path([(APP_X + 300, 860), (1088, 860), (1088, 1040), (ID_L, 1040)], AGENT, 2.2)
-alabel(APP_X + 306, 852, "RFC 8693 exchange:  sub stays alice,  azp becomes the agent",
-       AGENT, anchor="start", size=9.5)
-# ...and then calls downstream as itself.
-path([(APP_X + 300, 991), (APP_X + 300, 1004)], AGENT, 2.2)
-alabel(APP_X + 306, 1000, "acts as the agent — bound by the delegation, not by Alice's rights",
-       AGENT, anchor="start", size=9.5)
+# --- the agent trades Alice's token for one of its own -----------------------
+path([(APP_R, 928), (1088, 928), (1088, 1064), (ID_L, 1064)], AGENT, 2.2)
+alabel(1020, 920, "RFC 8693", AGENT, size=9.5)
+alabel(1020, 909, "exchange", AGENT, size=9.5)
 
 # --- ext-authz outbound ------------------------------------------------------
 path([(1140, 870), (1140, 1022)], IDENT, 2.0)
