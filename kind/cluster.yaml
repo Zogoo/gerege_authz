@@ -1,0 +1,31 @@
+# Single-node kind cluster for the Gerege IdP MVP.
+#
+# Host port mappings matter more than they look. Claim C2 is browser SSO across
+# *different hostnames*, so the ingress gateway has to be reachable from a real
+# browser on the host — `kubectl port-forward` would not do, because the whole
+# point is that profile.local.test and smarthome.local.test are separate origins
+# that do not share a cookie (mvp_docs/06 §3).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: gerege-idp
+
+nodes:
+  - role: control-plane
+    # Pinned by digest, as the kind release notes require: image tags alone do
+    # not guarantee an image built for this kind release.
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            - name: node-labels
+              value: "ingress-ready=true"
+    extraPortMappings:
+      # Istio ingress gateway, published on the host so a browser can reach it.
+      - containerPort: 30080
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 443
+        protocol: TCP

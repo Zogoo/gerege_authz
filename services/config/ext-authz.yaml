@@ -1,0 +1,454 @@
+# Gerege IdP — external authorizer route configuration.
+#
+# This document is the authorization map for the entire system. Changing which
+# permission guards an endpoint is a change to this file, not a rebuild
+# (mvp_docs/04 §4: "Route configuration is data, not code").
+#
+# Two properties are enforced when it loads, and ext-authz refuses to start if
+# either fails:
+#
+#   * defaultAction must be DENY. An endpoint with no rule returns 403 with
+#     reason `no_route_match` (M-006). The cityos sample fell back to a
+#     permissive default here; that is the one behaviour the MVP inverts.
+#   * no two rules of equal specificity may match the same request. Ambiguity
+#     is a startup error rather than a runtime coin toss.
+
+defaultAction: DENY
+
+# ---------------------------------------------------------------------------
+# Identity provider
+# ---------------------------------------------------------------------------
+# mvp_docs/06 hazard 4, which costs more lost time than the rest combined:
+# Keycloak is reachable at two URLs and the `iss` claim must match the one the
+# browser saw. `external` is what tokens carry and where the browser is sent;
+# `internal` is used for the code exchange, refresh, and JWKS. ext-authz checks
+# at startup that Keycloak agrees.
+issuer:
+  external: http://id.local.test/realms/gerege
+  internal: http://keycloak.id.svc.cluster.local:8080/realms/gerege
+
+cookie:
+  name: gerege_session
+  # Local demo runs over plain HTTP. Set true the moment TLS is in play.
+  secure: false
+  ttl: 8h
+  pendingTTL: 10m
+
+spicedb:
+  endpoint: spicedb.id.svc.cluster.local:50051
+  token: gerege-mvp-key
+  insecure: true
+  timeout: 3s
+
+# ---------------------------------------------------------------------------
+# Applications — the consent counterparties
+# ---------------------------------------------------------------------------
+# `firstParty` suppresses the consent check. This is a policy choice, not a
+# technical necessity (mvp_docs/03 §4), and it is what makes the Scenario 3a
+# contrast visible in one sitting: profile-app and smarthome-app read the same
+# record, and only one of them is asked to obtain consent first.
+applications:
+  - name: profile-app
+    displayName: Profile App
+    clientSecret: profile-app-secret
+    hosts: [profile.local.test]
+    firstParty: true
+
+  - name: account-app
+    displayName: Account & Consent Console
+    clientSecret: account-app-secret
+    hosts: [account.local.test]
+    firstParty: true
+
+  - name: smarthome-app
+    displayName: Smart Home
+    clientSecret: smarthome-app-secret
+    hosts: [smarthome.local.test]
+    firstParty: false
+
+# ---------------------------------------------------------------------------
+# Non-human callers
+# ---------------------------------------------------------------------------
+# A token whose `azp` appears here belongs to a device, not a person. The
+# principal becomes a gerege/system_principal and consent is never evaluated —
+# there is no user in the loop to have granted it (mvp_docs/02 §4.4).
+#
+# This is static configuration rather than a claim heuristic because "is this a
+# device" is a deployment fact, and a heuristic that guesses wrong in the
+# permissive direction is a bypass.
+systemPrincipals:
+  sensor-1: sensor-1
+
+# ---------------------------------------------------------------------------
+# Agents — delegated actors
+# ---------------------------------------------------------------------------
+# A token whose `azp` appears here came out of an RFC 8693 token exchange: the
+# `sub` is still the human, so every permission check passes on their authority.
+# What stops the agent inheriting that authority is the delegation check, which
+# ext-authz adds automatically for an agent principal — a separate, expiring
+# grant in SpiceDB naming this agent and the route's capability.
+#
+# Like system principals, this is configuration and not inference. "Is this an
+# agent" is a deployment fact, and a heuristic that guesses wrong in the
+# permissive direction is a bypass.
+agents:
+  - name: assistant-agent
+    object: assistant
+    displayName: Assistant
+
+rules:
+  # =========================================================================
+  # profile-app — browser, first-party
+  # =========================================================================
+  - id: profile-app-home
+    hosts: [profile.local.test]
+    methods: [GET]
+    path: /
+    authenticatedOnly: true
+
+  # Static assets get their own rule under their own prefix. mvp_docs/06
+  # hazard 3: the cityos README documents an over-broad `/:user/:attribute`
+  # pattern swallowing asset paths. Specificity ordering stops that here, and
+  # this rule makes the intent explicit rather than incidental.
+  - id: profile-app-static
+    hosts: [profile.local.test]
+    methods: [GET]
+    path: /static/*
+    public: true
+
+  - id: profile-app-view
+    hosts: [profile.local.test]
+    methods: [GET]
+    path: /profile/{userId}
+    resourceType: gerege/user_profile
+    resourceIdFrom: path:userId
+    permission: view
+    capability: profile_read
+    consentRequired: true
+    authMode: either
+    consistency: fully_consistent
+
+  # =========================================================================
+  # profile-service — internal API, never reachable from outside
+  # =========================================================================
+  - id: profile-service-view
+    hosts:
+      - profile-service.apps.svc.cluster.local
+      - profile-service.apps
+      - profile-service
+    methods: [GET]
+    path: /api/profile/{userId}
+    resourceType: gerege/user_profile
+    resourceIdFrom: path:userId
+    permission: view
+    capability: profile_read
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    # Scenario 3c: a valid, unexpired token belonging to Alice, replayed from
+    # anywhere other than these two workloads, is refused with
+    # `workload_not_registered`. Nothing about the token is wrong.
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/profile-app
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  - id: profile-service-edit
+    hosts:
+      - profile-service.apps.svc.cluster.local
+      - profile-service.apps
+      - profile-service
+    methods: [PUT]
+    path: /api/profile/{userId}
+    resourceType: gerege/user_profile
+    resourceIdFrom: path:userId
+    permission: edit
+    capability: profile_write
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/profile-app
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  # =========================================================================
+  # smarthome-service — browser + API, third-party
+  # =========================================================================
+  - id: smarthome-home
+    hosts: [smarthome.local.test]
+    methods: [GET]
+    path: /
+    authenticatedOnly: true
+
+  - id: smarthome-devices
+    hosts: [smarthome.local.test]
+    methods: [GET]
+    path: /home/{homeId}
+    resourceType: gerege/home
+    resourceIdFrom: path:homeId
+    permission: view
+    capability: devices_view
+    consentRequired: true
+    authMode: either
+    consistency: fully_consistent
+
+  # The edge check on an unlock is deliberately coarser than the one at
+  # device-service: here it asks whether the principal may see this home at
+  # all, there it asks whether they may unlock this particular lock.
+  #
+  # That difference is Scenario 3b. Downgrade Alice from `owner` to `guest` and
+  # this rule still permits — she can still see the home — while device-service
+  # refuses, because `operate_lock` derives from `administrate`. The external
+  # call succeeds and the internal one does not. A gateway-only architecture
+  # would have opened the door.
+  - id: smarthome-unlock
+    hosts: [smarthome.local.test]
+    methods: [POST]
+    path: /home/{homeId}/devices/{deviceId}/unlock
+    resourceType: gerege/home
+    resourceIdFrom: path:homeId
+    permission: view
+    capability: devices_unlock
+    consentRequired: true
+    # Opening a door is where the MVP draws the step-up line. A person must have
+    # authenticated deliberately, which an agent can never do on their behalf —
+    # so this route is closed to agents by construction rather than by policy
+    # they might be granted later (docs/09 §5.4).
+    stepUp: true
+    authMode: either
+    consistency: fully_consistent
+
+  - id: smarthome-lock
+    hosts: [smarthome.local.test]
+    methods: [POST]
+    path: /home/{homeId}/devices/{deviceId}/lock
+    resourceType: gerege/home
+    resourceIdFrom: path:homeId
+    permission: view
+    capability: devices_control
+    consentRequired: true
+    authMode: either
+    consistency: fully_consistent
+
+  - id: smarthome-state
+    hosts: [smarthome.local.test]
+    methods: [POST]
+    path: /home/{homeId}/devices/{deviceId}/state
+    resourceType: gerege/home
+    resourceIdFrom: path:homeId
+    permission: view
+    capability: devices_control
+    consentRequired: true
+    authMode: either
+    consistency: fully_consistent
+
+  # The consent demonstration: the same record profile-app reads without a
+  # prompt, requested by a third-party application.
+  - id: smarthome-myprofile
+    hosts: [smarthome.local.test]
+    methods: [GET]
+    path: /myprofile
+    resourceType: gerege/user_profile
+    resourceIdFrom: principal
+    permission: view
+    capability: profile_read
+    consentRequired: true
+    authMode: either
+    consistency: fully_consistent
+
+  # =========================================================================
+  # device-service — internal API plus one edge surface for telemetry
+  # =========================================================================
+  # These rules carry no `hosts`, so they apply both at the ingress gateway
+  # (where a request to device.local.test/internal/... arrives with no peer
+  # identity) and at device-service's own sidecar. In both cases `callers`
+  # refuses anything that is not smarthome-service.
+  - id: device-list
+    methods: [GET]
+    path: /internal/homes/{homeId}/devices
+    resourceType: gerege/home
+    resourceIdFrom: path:homeId
+    permission: view
+    capability: devices_view
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  - id: device-get
+    methods: [GET]
+    path: /internal/devices/{deviceId}
+    resourceType: gerege/device
+    resourceIdFrom: path:deviceId
+    permission: view
+    capability: devices_view
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  # `operate_lock`, not `operate`. A lock is a different class of object from a
+  # thermostat, and the schema says so (mvp_docs/03 §3).
+  - id: device-unlock
+    methods: [POST]
+    path: /internal/devices/{deviceId}/unlock
+    resourceType: gerege/device
+    resourceIdFrom: path:deviceId
+    permission: operate_lock
+    capability: devices_unlock
+    consentRequired: true
+    stepUp: true
+    authMode: bearer
+    consistency: fully_consistent
+    # agent-runner is a registered caller — it is allowed to *reach* this route.
+    # It is refused here anyway, by the step-up gate, which is the more
+    # interesting denial: being entitled to call something is not the same as
+    # being entitled to have it succeed.
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  - id: device-lock
+    methods: [POST]
+    path: /internal/devices/{deviceId}/lock
+    resourceType: gerege/device
+    resourceIdFrom: path:deviceId
+    permission: operate
+    capability: devices_control
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  - id: device-state
+    methods: [POST]
+    path: /internal/devices/{deviceId}/state
+    resourceType: gerege/device
+    resourceIdFrom: path:deviceId
+    permission: operate
+    capability: devices_control
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    callers:
+      - spiffe://cluster.local/ns/apps/sa/smarthome-service
+      - spiffe://cluster.local/ns/apps/sa/agent-runner
+
+  # The one route a device reaches from outside the mesh. No consent: no user
+  # is in the loop. No `callers`: there is no peer identity to verify, because
+  # the caller is not in the mesh at all — its identity is the token it holds
+  # and the relationship graph behind it.
+  #
+  # This is also the only rule that uses at_least_as_fresh rather than
+  # fully_consistent. Telemetry is high-frequency and no assertion depends on
+  # observing a revocation here, so it is the right place to exercise the
+  # ZedToken path (mvp_docs/03 §6).
+  - id: telemetry-ingest
+    methods: [POST]
+    path: /telemetry/{deviceId}
+    resourceType: gerege/device
+    resourceIdFrom: path:deviceId
+    permission: push_telemetry
+    consentRequired: false
+    authMode: bearer
+    consistency: at_least_as_fresh
+
+  # =========================================================================
+  # agent-runner — the agent
+  # =========================================================================
+  # Reaching the agent is not the same as the agent being able to do anything.
+  # This route only asks whether the principal may ask the agent to act at all;
+  # every downstream call the agent then makes is authorized separately, against
+  # the delegation, at the service that owns the data.
+  #
+  # `devices_view` rather than something agent-specific: asking the assistant to
+  # look at your home is, at this hop, asking to look at your home.
+  - id: agent-task
+    methods: [POST]
+    path: /agent/tasks/{task}
+    resourceType: gerege/home
+    resourceIdFrom: literal:alice-home
+    permission: view
+    capability: devices_view
+    consentRequired: true
+    authMode: bearer
+    consistency: fully_consistent
+    callers: [spiffe://cluster.local/ns/apps/sa/smarthome-service]
+
+  - id: smarthome-assistant
+    hosts: [smarthome.local.test]
+    methods: [GET]
+    path: /assistant
+    resourceType: gerege/home
+    resourceIdFrom: literal:alice-home
+    permission: view
+    capability: devices_view
+    consentRequired: true
+    authMode: either
+    consistency: fully_consistent
+
+  # =========================================================================
+  # account-app — consent and revocation
+  # =========================================================================
+  # These routes need an established principal and touch no resource of their
+  # own: a user managing their own consent is acting on themselves. The service
+  # takes the subject from the authenticated principal and never from the form,
+  # so there is nothing here for a permission check to add.
+  - id: account-home
+    hosts: [account.local.test]
+    methods: [GET]
+    path: /
+    authenticatedOnly: true
+
+  - id: account-consent-screen
+    hosts: [account.local.test]
+    methods: [GET]
+    path: /consent
+    authenticatedOnly: true
+
+  - id: account-grant
+    hosts: [account.local.test]
+    methods: [POST]
+    path: /grant
+    authenticatedOnly: true
+
+  # Delegating is a user acting on themselves, exactly like consent: the console
+  # takes the delegator from the authenticated principal and never from the form.
+  - id: account-delegate-screen
+    hosts: [account.local.test]
+    methods: [GET]
+    path: /delegate
+    authenticatedOnly: true
+
+  - id: account-delegations
+    hosts: [account.local.test]
+    methods: [POST]
+    path: /delegations
+    authenticatedOnly: true
+
+  - id: account-undelegate
+    hosts: [account.local.test]
+    methods: [POST]
+    path: /undelegate
+    authenticatedOnly: true
+
+  - id: account-revoke
+    hosts: [account.local.test]
+    methods: [POST]
+    path: /revoke
+    authenticatedOnly: true
+
+  # =========================================================================
+  # Everything else
+  # =========================================================================
+  - id: favicon
+    methods: [GET]
+    path: /favicon.ico
+    public: true

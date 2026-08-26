@@ -1,0 +1,47 @@
+# The demo world, written at bootstrap with `zed import`.
+#
+# Two absences are as deliberate as anything present:
+#
+#   * No consent relationships. mvp_docs/03 §7: consent must be granted live
+#     during the demo, or assertion A6 — denied before consent — has nothing to
+#     show. Seeding it would quietly destroy the most interesting part of the
+#     demonstration.
+#
+#   * No relationships for Bob to anything of Alice's. His denials are real
+#     denials, not configuration gaps. Scenario 2 turns one of them into a
+#     permit by adding a single relationship, with no redeploy and the same
+#     unchanged token.
+#
+# The `gerege/` prefix is carried from day one even though the MVP is
+# single-tenant, so that multi-tenancy later is a policy change rather than a
+# data migration (docs/07 ADR-010).
+#
+# Subject ids are Keycloak `sub` values. The realm import fixes alice's and
+# bob's ids to their usernames, so the graph reads the way the documents write
+# it; nothing in the code depends on that, and a realm issuing UUIDs would work
+# unchanged.
+
+schemaFile: "schema.zed"
+
+relationships: |-
+  // --- who owns what ------------------------------------------------------
+  gerege/user_profile:alice#owner@gerege/user:alice
+  gerege/user_profile:bob#owner@gerege/user:bob
+  gerege/home:alice-home#owner@gerege/user:alice
+
+  // --- where the devices are ----------------------------------------------
+  gerege/device:thermostat-1#home@gerege/home:alice-home
+  gerege/device:lock-1#home@gerege/home:alice-home
+  gerege/device:sensor-1#home@gerege/home:alice-home
+
+  // --- the agent ----------------------------------------------------------
+  // The agent exists and Alice controls it. That is all. It holds no
+  // capabilities until she delegates some, and every delegation expires —
+  // so, like consent, none is seeded. Scenario 6 starts from a refusal.
+  gerege/agent:assistant#controller@gerege/user:alice
+
+  // --- the device's own identity ------------------------------------------
+  // This single relationship is the whole of sensor-1's authority. It may
+  // report its own readings and do nothing else — not another device's
+  // telemetry, not a user's profile.
+  gerege/device:sensor-1#self@gerege/system_principal:sensor-1

@@ -1,0 +1,122 @@
+# SpiceDB — every permission and every consent decision (M-001, M-003).
+#
+# PostgreSQL rather than memdb (M-004). memdb would remove a container and a
+# bootstrap step, and would also wipe the demo world on every restart —
+# including consent grants. "Revoke consent, restart the pod, confirm it is
+# still revoked" would then pass vacuously, which is worse than not testing it.
+#
+# Not in the mesh, on purpose: `zed` is the most useful debugging tool in this
+# stack ("zed permission check ... --explain" turns "why was this denied" into a
+# two-second query), and it reaches SpiceDB through `kubectl port-forward`,
+# which a STRICT-mTLS sidecar would refuse.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spicedb-preshared-key
+  namespace: id
+type: Opaque
+stringData:
+  key: gerege-mvp-key
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spicedb-migrate
+  namespace: id
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: ghcr.io/authzed/spicedb:v1.56.0
+          # A distinct operation from serving. SpiceDB requires its datastore
+          # schema to be migrated before the server will run against it; this is
+          # not something the server does at startup (mvp_docs/06 §4, step 6).
+          args:
+            - migrate
+            - head
+            - --datastore-engine=postgres
+            - --datastore-conn-uri=$(DATASTORE_URI)
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: db-credentials, key: spicedb-password }
+            - name: DATASTORE_URI
+              value: postgres://spicedb:$(PGPASSWORD)@spicedb-db.id.svc.cluster.local:5432/spicedb?sslmode=disable
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb
+  namespace: id
+  labels: { app: spicedb }
+spec:
+  selector: { app: spicedb }
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: http
+      port: 8443
+      targetPort: 8443
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb
+  namespace: id
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: spicedb }
+  template:
+    metadata:
+      labels: { app: spicedb }
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: spicedb
+          image: ghcr.io/authzed/spicedb:v1.56.0
+          args:
+            - serve
+            - --grpc-preshared-key=$(SPICEDB_KEY)
+            - --datastore-engine=postgres
+            - --datastore-conn-uri=$(DATASTORE_URI)
+            - --http-enabled
+            - --http-addr=:8443
+          env:
+            - name: SPICEDB_KEY
+              valueFrom:
+                secretKeyRef: { name: spicedb-preshared-key, key: key }
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: db-credentials, key: spicedb-password }
+            - name: DATASTORE_URI
+              value: postgres://spicedb:$(PGPASSWORD)@spicedb-db.id.svc.cluster.local:5432/spicedb?sslmode=disable
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: http
+              containerPort: 8443
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8443 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443 }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 150m, memory: 320Mi }

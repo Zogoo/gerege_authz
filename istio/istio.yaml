@@ -1,0 +1,94 @@
+# Istio installation for the MVP.
+#
+# Three things in this file do the enforcement work:
+#
+#   1. The `gerege-ext-authz` extension provider registers the Go authorizer as
+#      a gRPC external authorizer the mesh may call. Per Istio's documentation
+#      the Envoy ext_authz provider is the only supported type, so this is the
+#      mechanism, not a choice among several.
+#
+#   2. `failOpen: false` — an unreachable authorizer denies. This is claim C8,
+#      and it is the single most important line in the file. With failOpen true
+#      an authorization outage becomes an open door precisely when nobody is
+#      watching.
+#
+#   3. `includeRequestBodyInCheck` is absent. The authorizer decides on method,
+#      path and identity; sending request bodies would route user data through
+#      the authorizer for no decision benefit (mvp_docs/02 §5).
+#
+# The extension provider must exist before any workload starts, because it is
+# mesh configuration and adding it later requires restarting sidecars — the
+# confusing "why is nothing being checked" phase in mvp_docs/06 §4.
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: gerege-idp
+spec:
+  profile: default
+  meshConfig:
+    accessLogFile: /dev/stdout
+    extensionProviders:
+      - name: gerege-ext-authz
+        envoyExtAuthzGrpc:
+          service: ext-authz.id.svc.cluster.local
+          port: 9001
+          # Generous on purpose. The MVP prioritises debuggability over latency;
+          # production tightens this (docs/01 §3).
+          timeout: 2s
+          failOpen: false
+          statusOnError: "403"
+          # Denials carry a machine-readable reason. "403 Forbidden" with no
+          # explanation makes a demo impossible to narrate and a production
+          # incident impossible to triage (mvp_docs/04 §8).
+          headersToDownstreamOnDeny:
+            - content-type
+            - set-cookie
+            - location
+            - www-authenticate
+            - x-authz-reason
+            - x-authz-decision-id
+          headersToDownstreamOnAllow:
+            - x-authz-decision-id
+          # These are what the applications render "you are signed in as Alice"
+          # from, plus the relayed access token that carries the principal and
+          # `azp` onto the next hop.
+          headersToUpstreamOnAllow:
+            - x-user-id
+            - x-user-name
+            - x-application
+            - x-authz-decision-id
+            - authorization
+  values:
+    global:
+      proxy:
+        # Small enough for a laptop; large enough not to throttle during a demo.
+        resources:
+          requests:
+            cpu: 20m
+            memory: 96Mi
+  components:
+    pilot:
+      k8s:
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: true
+        k8s:
+          service:
+            type: NodePort
+            ports:
+              - name: http2
+                port: 80
+                targetPort: 8080
+                nodePort: 30080
+              - name: https
+                port: 443
+                targetPort: 8443
+                nodePort: 30443
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi

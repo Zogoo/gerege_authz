@@ -1,0 +1,11 @@
+# compiled binaries land here if `go build ./cmd/...` is run without -o
+/services/ext-authz
+/services/profile-app
+/services/profile-service
+/services/smarthome-service
+/services/device-service
+/services/account-app
+/services/telemetry-simulator
+/services/configcheck
+/services/verify
+/.env.demo

@@ -1,0 +1,139 @@
+# Two PostgreSQL instances, one for Keycloak and one for SpiceDB.
+#
+# mvp_docs/02 §1: sharing a database would couple an identity schema migration
+# to an authorization outage, and blur the boundary the whole design rests on —
+# Keycloak knows who you are, SpiceDB knows what you may do. Two small
+# containers cost little and keep that boundary visible.
+#
+# Neither database is in the mesh. They speak to exactly one client each over a
+# cluster-internal address, and a sidecar would add a moving part to the
+# bootstrap without adding a decision anyone can demonstrate.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: id
+type: Opaque
+stringData:
+  keycloak-password: keycloak-dev-password
+  spicedb-password: spicedb-dev-password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-db
+  namespace: id
+spec:
+  selector: { app: keycloak-db }
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-db
+  namespace: id
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: keycloak-db }
+  template:
+    metadata:
+      labels: { app: keycloak-db }
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine
+          env:
+            - name: POSTGRES_DB
+              value: keycloak
+            - name: POSTGRES_USER
+              value: keycloak
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: db-credentials, key: keycloak-password }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "keycloak", "-d", "keycloak"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 192Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb-db
+  namespace: id
+spec:
+  selector: { app: spicedb-db }
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb-db
+  namespace: id
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: spicedb-db }
+  template:
+    metadata:
+      labels: { app: spicedb-db }
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine
+          # SpiceDB's Watch API requires commit-timestamp tracking. The MVP does
+          # not use Watch — it does not cache (M-005) — but the flag costs
+          # nothing now and its absence is an obscure failure later, when the
+          # cache-invalidation design from docs/04 §4 is added.
+          args:
+            - postgres
+            - -c
+            - track_commit_timestamp=on
+          env:
+            - name: POSTGRES_DB
+              value: spicedb
+            - name: POSTGRES_USER
+              value: spicedb
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: db-credentials, key: spicedb-password }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "spicedb", "-d", "spicedb"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 192Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}

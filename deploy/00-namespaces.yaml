@@ -1,0 +1,39 @@
+# Namespaces and the sidecar-injection boundary.
+#
+# Both `id` and `apps` have injection enabled, and the components that should
+# not have a sidecar opt out individually with
+# `sidecar.istio.io/inject: "false"`. That reads better than the reverse: the
+# default is "in the mesh", and every exception is visible next to the workload
+# it applies to, with a reason.
+#
+# The exceptions are Keycloak, SpiceDB and the two databases. They are the
+# identity plane, not applications. SpiceDB in particular must stay reachable
+# through `kubectl port-forward` for `zed`, which STRICT mTLS would refuse —
+# and `zed permission check --explain` is the single most useful debugging tool
+# in this stack.
+#
+# `devices` is deliberately outside the mesh. A real IoT device is not a mesh
+# member; it holds a token and talks to the edge. Running the simulator there
+# rather than in `apps` is what makes Scenario 4 honest.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: id
+  labels:
+    istio-injection: enabled
+    gerege.io/plane: identity
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps
+  labels:
+    istio-injection: enabled
+    gerege.io/plane: applications
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devices
+  labels:
+    gerege.io/plane: external

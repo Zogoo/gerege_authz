@@ -1,0 +1,120 @@
+# Keycloak — authentication only (M-001).
+#
+# No Authorization Services, no UMA tickets, no resource sets. Keycloak issues
+# identity and runs login, SSO and logout. Every permission and consent decision
+# comes from SpiceDB. That boundary is the sentence the whole demonstration
+# rests on: Keycloak knows who you are, SpiceDB knows what you may do.
+#
+# KC_HOSTNAME is the setting that decides whether any of this works. mvp_docs/06
+# hazard 4: the `iss` claim must match the URL the browser was redirected to, or
+# token validation fails with an error pointing at the wrong thing. Fixing the
+# hostname to the browser-facing URL — and leaving backchannel-dynamic off —
+# makes Keycloak report the same issuer no matter which address it was reached
+# on. ext-authz asserts this at startup rather than discovering it at 2am.
+# The realm ConfigMap is NOT declared here. It is generated at bootstrap from
+# keycloak/realm-gerege.json:
+#
+#   kubectl -n id create configmap keycloak-realm \
+#     --from-file=realm-gerege.json=keycloak/realm-gerege.json \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# Declaring a placeholder here and generating the real one separately means
+# whichever runs last wins — and `kubectl apply -f` on this file would silently
+# replace the realm with the placeholder. The realm would then not import, and
+# the only visible symptom would be a 404 on the discovery document several
+# steps later.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: id
+  labels: { app: keycloak }
+spec:
+  selector: { app: keycloak }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: management
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: id
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: keycloak }
+  template:
+    metadata:
+      labels: { app: keycloak }
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.7.2
+          args: ["start", "--import-realm"]
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://keycloak-db.id.svc.cluster.local:5432/keycloak
+            - name: KC_DB_USERNAME
+              value: keycloak
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: db-credentials, key: keycloak-password }
+
+            # The browser-facing base URL. Every issuer, authorization and
+            # end-session URL Keycloak advertises is built from this, whether
+            # the request arrived through the gateway or from inside the mesh.
+            - name: KC_HOSTNAME
+              value: http://id.local.test
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "false"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            # Single replica: skip Infinispan cluster discovery entirely.
+            - name: KC_CACHE
+              value: local
+
+            # Development credentials, stated plainly. mvp_docs/01 §6: this is
+            # not a production-secure deployment and does not pretend to be.
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              value: admin
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 9000
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 9000 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: { path: /health/live, port: 9000 }
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            failureThreshold: 10
+          resources:
+            requests: { cpu: 300m, memory: 768Mi }
+          volumeMounts:
+            - name: realm
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
+      volumes:
+        - name: realm
+          configMap:
+            name: keycloak-realm

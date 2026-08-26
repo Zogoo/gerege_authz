@@ -1,0 +1,134 @@
+# Gerege IdP — MVP schema assertion suite.
+#
+# Run with:  zed validate mvp/spicedb/validation.yaml
+#
+# mvp_docs/03 §8: "The negative assertions matter more than the positive ones.
+# A schema that grants too little produces a support ticket. One that grants
+# too much produces a breach."
+#
+# The relationships below are TEST fixtures. They are a superset of the live
+# seed data in seed.zed — in particular they include consent grants and a guest,
+# which are deliberately NOT seeded into the running system so that Scenario 3a
+# starts from "no consent".
+
+schemaFile: "schema.zed"
+
+relationships: |-
+  // --- profiles -------------------------------------------------------------
+  gerege/user_profile:alice#owner@gerege/user:alice
+  gerege/user_profile:bob#owner@gerege/user:bob
+  // carol has been explicitly shared read access — this is the A5 mechanism
+  gerege/user_profile:alice#reader@gerege/user:carol
+
+  // --- home and devices -----------------------------------------------------
+  gerege/home:alice-home#owner@gerege/user:alice
+  gerege/home:alice-home#resident@gerege/user:carol
+  gerege/home:alice-home#guest@gerege/user:dave
+
+  gerege/device:thermostat-1#home@gerege/home:alice-home
+  gerege/device:lock-1#home@gerege/home:alice-home
+  gerege/device:sensor-1#home@gerege/home:alice-home
+  gerege/device:sensor-1#self@gerege/system_principal:sensor-1
+
+  // --- the agent and what alice delegated to it (test fixture only) -------
+  gerege/agent:assistant#controller@gerege/user:alice
+
+  gerege/delegation:alice|assistant#delegator@gerege/user:alice
+  gerege/delegation:alice|assistant#delegate@gerege/agent:assistant
+  gerege/delegation:alice|assistant#granted@gerege/capability:profile_read[expiration:2999-01-01T00:00:00Z]
+  gerege/delegation:alice|assistant#granted@gerege/capability:devices_control[expiration:2999-01-01T00:00:00Z]
+  // a delegation that has already lapsed — SpiceDB drops it on its own
+  gerege/delegation:alice|assistant#granted@gerege/capability:devices_view[expiration:2020-01-01T00:00:00Z]
+
+  // --- consent (test fixture only) -----------------------------------------
+  // alice has consented to smarthome-app for profile_read + devices_control,
+  // but NOT for devices_unlock.
+  gerege/consent_grant:alice|smarthome-app#subject@gerege/user:alice
+  gerege/consent_grant:alice|smarthome-app#grantee@gerege/application:smarthome-app
+  gerege/consent_grant:alice|smarthome-app#granted@gerege/capability:profile_read
+  gerege/consent_grant:alice|smarthome-app#granted@gerege/capability:devices_control
+
+assertions:
+  assertTrue:
+    # --- user_profile#view / #edit ------------------------------------------
+    - "gerege/user_profile:alice#view@gerege/user:alice"
+    - "gerege/user_profile:alice#edit@gerege/user:alice"
+    - "gerege/user_profile:bob#view@gerege/user:bob"
+    - "gerege/user_profile:alice#view@gerege/user:carol"
+
+    # --- home ----------------------------------------------------------------
+    - "gerege/home:alice-home#administrate@gerege/user:alice"
+    - "gerege/home:alice-home#operate@gerege/user:alice"
+    - "gerege/home:alice-home#operate@gerege/user:carol"
+    - "gerege/home:alice-home#view@gerege/user:alice"
+    - "gerege/home:alice-home#view@gerege/user:carol"
+    - "gerege/home:alice-home#view@gerege/user:dave"
+
+    # --- device: inherited through the home (chain depth 2) ------------------
+    - "gerege/device:thermostat-1#view@gerege/user:alice"
+    - "gerege/device:thermostat-1#view@gerege/user:dave"
+    - "gerege/device:thermostat-1#operate@gerege/user:alice"
+    - "gerege/device:thermostat-1#operate@gerege/user:carol"
+    - "gerege/device:lock-1#operate_lock@gerege/user:alice"
+
+    # --- non-human principal -------------------------------------------------
+    - "gerege/device:sensor-1#push_telemetry@gerege/system_principal:sensor-1"
+
+    # --- consent -------------------------------------------------------------
+    - "gerege/consent_grant:alice|smarthome-app#includes@gerege/capability:profile_read"
+    - "gerege/consent_grant:alice|smarthome-app#includes@gerege/capability:devices_control"
+    - "gerege/consent_grant:alice|smarthome-app#revoke@gerege/user:alice"
+
+    # --- the agent -----------------------------------------------------------
+    - "gerege/agent:assistant#act@gerege/user:alice"
+    - "gerege/delegation:alice|assistant#includes@gerege/capability:profile_read"
+    - "gerege/delegation:alice|assistant#includes@gerege/capability:devices_control"
+    - "gerege/delegation:alice|assistant#revoke@gerege/user:alice"
+
+  assertFalse:
+    # --- A4: Bob has no relationship to Alice's objects ----------------------
+    - "gerege/user_profile:alice#view@gerege/user:bob"
+    - "gerege/user_profile:alice#edit@gerege/user:bob"
+    - "gerege/user_profile:bob#view@gerege/user:alice"
+    - "gerege/home:alice-home#view@gerege/user:bob"
+    - "gerege/device:lock-1#view@gerege/user:bob"
+    - "gerege/device:lock-1#operate@gerege/user:bob"
+    - "gerege/device:lock-1#operate_lock@gerege/user:bob"
+
+    # --- a guest may look, may not act ---------------------------------------
+    - "gerege/home:alice-home#operate@gerege/user:dave"
+    - "gerege/home:alice-home#administrate@gerege/user:dave"
+    - "gerege/device:thermostat-1#operate@gerege/user:dave"
+    - "gerege/device:lock-1#operate_lock@gerege/user:dave"
+
+    # --- a resident may operate a thermostat, NOT a lock ---------------------
+    # This is the distinction that makes operate_lock worth having.
+    - "gerege/device:lock-1#operate_lock@gerege/user:carol"
+
+    # --- a reader may view but not edit --------------------------------------
+    - "gerege/user_profile:alice#edit@gerege/user:carol"
+
+    # --- consent is not a blanket grant --------------------------------------
+    - "gerege/consent_grant:alice|smarthome-app#includes@gerege/capability:devices_unlock"
+    - "gerege/consent_grant:alice|smarthome-app#includes@gerege/capability:profile_write"
+    - "gerege/consent_grant:alice|profile-app#includes@gerege/capability:profile_read"
+    - "gerege/consent_grant:bob|smarthome-app#includes@gerege/capability:profile_read"
+    - "gerege/consent_grant:alice|smarthome-app#revoke@gerege/user:bob"
+
+    # --- an agent holds only what was delegated, and only while it lasts -----
+    # devices_unlock was never delegated. The agent holds Alice's token and her
+    # permission on the lock is intact, and it still cannot open the door.
+    - "gerege/delegation:alice|assistant#includes@gerege/capability:devices_unlock"
+    - "gerege/delegation:alice|assistant#includes@gerege/capability:profile_write"
+    # devices_view was delegated and has expired. SpiceDB stops honouring it
+    # without anyone having to remember to delete it.
+    - "gerege/delegation:alice|assistant#includes@gerege/capability:devices_view"
+    # a delegation is one user's, to one agent
+    - "gerege/delegation:bob|assistant#includes@gerege/capability:profile_read"
+    - "gerege/delegation:alice|assistant#revoke@gerege/user:bob"
+    - "gerege/agent:assistant#act@gerege/user:bob"
+
+    # --- a device identity is not a skeleton key -----------------------------
+    - "gerege/device:thermostat-1#push_telemetry@gerege/system_principal:sensor-1"
+    - "gerege/device:lock-1#push_telemetry@gerege/system_principal:sensor-1"
+    - "gerege/user_profile:alice#view@gerege/user:sensor-1"

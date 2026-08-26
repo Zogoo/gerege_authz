@@ -1,0 +1,89 @@
+# The external authorizer.
+#
+# Not in the mesh, for two reasons. First, every sidecar calls it on every
+# request; if it had a sidecar governed by the same CUSTOM policy, authorizing a
+# request would require authorizing the authorization request, and so on.
+# Second, bootstrap: the mesh policy that routes traffic through ext-authz is
+# applied after ext-authz is ready (mvp_docs/06 §4, step 11), and a
+# self-referential dependency would make that ordering impossible rather than
+# merely important.
+#
+# Three ports, three trust levels:
+#   9001  gRPC ext_authz — the only port in the Service that matters
+#   9002  liveness only, so kubelet probes work without mesh credentials
+#   9003  decision log for demos — pod-only, never published in a Service
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ext-authz
+  namespace: id
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ext-authz
+  namespace: id
+  labels: { app: ext-authz }
+spec:
+  selector: { app: ext-authz }
+  ports:
+    - name: grpc-authz
+      port: 9001
+      targetPort: 9001
+      appProtocol: grpc
+    - name: http-health
+      port: 9002
+      targetPort: 9002
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ext-authz
+  namespace: id
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ext-authz }
+  template:
+    metadata:
+      labels: { app: ext-authz }
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: ext-authz
+      containers:
+        - name: ext-authz
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/ext-authz"]
+          env:
+            - name: CONFIG_PATH
+              value: /etc/ext-authz/config.yaml
+            - name: CONSENT_BASE_URL
+              value: http://account.local.test
+          ports:
+            - name: grpc-authz
+              containerPort: 9001
+            - name: health
+              containerPort: 9002
+            - name: decisions
+              containerPort: 9003
+          readinessProbe:
+            httpGet: { path: /readyz, port: 9002 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 40
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9002 }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ext-authz
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: ext-authz-config

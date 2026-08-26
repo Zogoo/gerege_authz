@@ -1,0 +1,368 @@
+# The four demonstration workloads.
+#
+# Every one of them has its own ServiceAccount (M-010). This is not tidiness:
+# Istio derives each workload's SPIFFE identity from its ServiceAccount, and
+# that identity is what ext-authz reads from `source.principal` to decide
+# whether a caller is registered to serve an application. Share a
+# ServiceAccount between two workloads and they become one identity — Scenario
+# 3c and assertion A10 would then pass for the wrong reason, which is worse
+# than failing.
+#
+# None of these services contains authorization logic. Look for it: there is
+# none. That is the property the architecture buys.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: profile-app, namespace: apps }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: profile-service, namespace: apps }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: smarthome-service, namespace: apps }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: device-service, namespace: apps }
+---
+# The agent gets its own ServiceAccount like everything else, and for the same
+# reason: its SPIFFE identity is what lets device-service tell an agent's call
+# apart from smarthome-service's. An agent that shared an identity with the
+# service that invoked it would be invisible at the very hop that has to see it.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: agent-runner, namespace: apps }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: profile-app
+  namespace: apps
+  labels: { app: profile-app }
+spec:
+  selector: { app: profile-app }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profile-app
+  namespace: apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: profile-app }
+  template:
+    metadata:
+      labels: { app: profile-app, version: v1 }
+      annotations:
+        # Probes originate on the node and cannot present mesh credentials, so
+        # the health port is excluded from interception (mvp_docs/02 §5). It
+        # serves liveness and nothing else; anything else there would be an
+        # authorization bypass.
+        traffic.sidecar.istio.io/excludeInboundPorts: "8081"
+    spec:
+      serviceAccountName: profile-app
+      containers:
+        - name: app
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/profile-app"]
+          env:
+            - name: PROFILE_SERVICE_URL
+              value: http://profile-service.apps.svc.cluster.local
+            - name: SMARTHOME_URL
+              value: http://smarthome.local.test
+            - name: ACCOUNT_URL
+              value: http://account.local.test
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: profile-service
+  namespace: apps
+  labels: { app: profile-service }
+spec:
+  selector: { app: profile-service }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profile-service
+  namespace: apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: profile-service }
+  template:
+    metadata:
+      labels: { app: profile-service, version: v1 }
+      annotations:
+        traffic.sidecar.istio.io/excludeInboundPorts: "8081"
+    spec:
+      serviceAccountName: profile-service
+      containers:
+        - name: app
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/profile-service"]
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smarthome-service
+  namespace: apps
+  labels: { app: smarthome-service }
+spec:
+  selector: { app: smarthome-service }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smarthome-service
+  namespace: apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: smarthome-service }
+  template:
+    metadata:
+      labels: { app: smarthome-service, version: v1 }
+      annotations:
+        traffic.sidecar.istio.io/excludeInboundPorts: "8081"
+    spec:
+      serviceAccountName: smarthome-service
+      containers:
+        - name: app
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/smarthome-service"]
+          env:
+            - name: DEVICE_SERVICE_URL
+              value: http://device-service.apps.svc.cluster.local
+            - name: PROFILE_SERVICE_URL
+              value: http://profile-service.apps.svc.cluster.local
+            - name: ACCOUNT_URL
+              value: http://account.local.test
+            - name: AGENT_RUNNER_URL
+              value: http://agent-runner.apps.svc.cluster.local
+            - name: PROFILE_APP_URL
+              value: http://profile.local.test
+            - name: HOME_ID
+              value: alice-home
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: device-service
+  namespace: apps
+  labels: { app: device-service }
+spec:
+  selector: { app: device-service }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: device-service
+  namespace: apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: device-service }
+  template:
+    metadata:
+      labels: { app: device-service, version: v1 }
+      annotations:
+        traffic.sidecar.istio.io/excludeInboundPorts: "8081"
+    spec:
+      serviceAccountName: device-service
+      containers:
+        - name: app
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/device-service"]
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-runner
+  namespace: apps
+  labels: { app: agent-runner }
+spec:
+  selector: { app: agent-runner }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      appProtocol: http
+---
+# agent-runner is the agent: it exchanges a user's token for one of its own
+# (RFC 8693) and then acts. It is an ordinary mesh workload — the thing that
+# makes it an agent is the token it presents downstream, not how it is deployed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-runner
+  namespace: apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: agent-runner }
+  template:
+    metadata:
+      labels: { app: agent-runner, version: v1 }
+      annotations:
+        traffic.sidecar.istio.io/excludeInboundPorts: "8081"
+    spec:
+      serviceAccountName: agent-runner
+      containers:
+        - name: app
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/agent-runner"]
+          env:
+            # The exchange is a back-channel call, so it uses the in-cluster
+            # address; the issuer the token carries is still the browser-facing
+            # one (mvp_docs/06 hazard 4).
+            - name: TOKEN_URL
+              value: http://keycloak.id.svc.cluster.local:8080/realms/gerege/protocol/openid-connect/token
+            - name: AGENT_CLIENT_ID
+              value: assistant-agent
+            - name: AGENT_CLIENT_SECRET
+              value: assistant-agent-secret
+            - name: DEVICE_SERVICE_URL
+              value: http://device-service.apps.svc.cluster.local
+            - name: PROFILE_SERVICE_URL
+              value: http://profile-service.apps.svc.cluster.local
+            - name: HOME_ID
+              value: alice-home
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+---
+# The account console lives in the identity plane, not with the demo apps: it is
+# the only component permitted to write consent relationships, and keeping that
+# write path in its own process with its own identity is what lets ext-authz
+# stay read-only on SpiceDB (mvp_docs/04 §1).
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: account-app, namespace: id }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account-app
+  namespace: id
+  labels: { app: account-app }
+spec:
+  selector: { app: account-app }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account-app
+  namespace: id
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: account-app }
+  template:
+    metadata:
+      labels: { app: account-app, version: v1 }
+      annotations:
+        traffic.sidecar.istio.io/excludeInboundPorts: "8081"
+    spec:
+      serviceAccountName: account-app
+      containers:
+        - name: app
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/account-app"]
+          env:
+            - name: SPICEDB_ENDPOINT
+              value: spicedb.id.svc.cluster.local:50051
+            - name: SPICEDB_INSECURE
+              value: "true"
+            - name: SPICEDB_TOKEN
+              valueFrom:
+                secretKeyRef: { name: spicedb-preshared-key, key: key }
+            - name: PROFILE_APP_URL
+              value: http://profile.local.test
+            - name: SMARTHOME_URL
+              value: http://smarthome.local.test
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }

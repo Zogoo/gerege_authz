@@ -1,0 +1,174 @@
+{
+  "realm": "gerege",
+  "displayName": "Gerege IdP (MVP)",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "offlineSessionIdleTimeout": 2592000,
+  "users": [
+    {
+      "id": "alice",
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Andersen",
+      "email": "alice@gerege.test",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "bob",
+      "username": "bob",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Baker",
+      "email": "bob@gerege.test",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "bob",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "profile-app",
+      "name": "Profile App (first-party)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "profile-app-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "http://profile.local.test/*",
+        "http://account.local.test/*"
+      ],
+      "webOrigins": [
+        "http://profile.local.test",
+        "http://account.local.test"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://profile.local.test/*##http://account.local.test/*"
+      }
+    },
+    {
+      "clientId": "account-app",
+      "name": "Account & Consent Console",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "account-app-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "http://account.local.test/*"
+      ],
+      "webOrigins": [
+        "http://account.local.test"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://account.local.test/*"
+      }
+    },
+    {
+      "clientId": "smarthome-app",
+      "name": "Smart Home (third-party)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "smarthome-app-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "http://smarthome.local.test/*"
+      ],
+      "webOrigins": [
+        "http://smarthome.local.test"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://smarthome.local.test/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "assistant-agent-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "assistant-agent",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "sensor-1",
+      "name": "sensor-1 (IoT device identity)",
+      "description": "Non-human principal. Client credentials only \u2014 no browser flow.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "sensor-1-secret",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [],
+      "webOrigins": []
+    },
+    {
+      "clientId": "assistant-agent",
+      "name": "Assistant (AI agent)",
+      "description": "A delegated actor. Obtains its identity by exchanging a user's token (RFC 8693); never runs a browser flow and holds no service account.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "assistant-agent-secret",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      }
+    }
+  ]
+}

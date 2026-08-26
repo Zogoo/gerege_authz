@@ -1,0 +1,165 @@
+/**
+ * Gerege IdP — MVP permission schema.
+ *
+ * Every authorization and every consent decision in the system is answered from
+ * this schema. Keycloak holds no authorization state (M-001).
+ *
+ * Modelling principles (mvp_docs/03 §1):
+ *   P1  relations are structural, permissions are computed
+ *   P2  object IDs carry the `gerege/` tenant prefix from day one
+ *   P3  no personal data — subjects are opaque Keycloak `sub` values
+ *   P4  deny is the absence of a grant; revocation is deletion
+ *   P5  consent is modelled exactly like permission
+ *   P6  bounded depth — maximum chain length is 2 (device -> home)
+ *
+ * Note on expiring relationships: `use expiration` enables per-relationship
+ * expiry, which SpiceDB enforces itself. It is what makes a delegation to an
+ * agent task-scoped rather than standing — the grant disappears on its own,
+ * with nobody having to remember to remove it.
+ *
+ * Note on capability identifiers: mvp_docs/03 writes capabilities as
+ * `profile.read`. SpiceDB object IDs are restricted to [a-zA-Z0-9/_|-=+]
+ * (pkg/tuple/parsing.go, resourceIDExpr), so dots are not permitted. The
+ * capability IDs below use `_` instead; the human-readable label lives in the
+ * consent UI, not in the object ID.
+ */
+
+use expiration
+
+/** A human principal. Terminal subject; the ID is the Keycloak `sub`. */
+definition gerege/user {}
+
+/** An OAuth client a user can consent to — `profile-app`, `smarthome-app`. */
+definition gerege/application {}
+
+/** A non-human caller, e.g. `sensor-1`. Has an accountable human operator. */
+definition gerege/system_principal {}
+
+/**
+ * A named thing an application may be granted.
+ * An object rather than a schema permission, so new capabilities are data and
+ * not a schema rollout (mvp_docs/03 §2, docs/09 ADR-015).
+ */
+definition gerege/capability {}
+
+/**
+ * One user's consent to one application.
+ * Object ID pattern: `<user>|<application>`.
+ */
+definition gerege/consent_grant {
+	/** whose data */
+	relation subject: gerege/user
+	/** who was granted */
+	relation grantee: gerege/application
+	/** which capabilities — one relationship each */
+	relation granted: gerege/capability
+
+	permission includes = granted
+	permission revoke = subject
+}
+
+/** A user's profile record. Owned by exactly one user. */
+definition gerege/user_profile {
+	relation owner: gerege/user
+	/** explicitly shared read access */
+	relation reader: gerege/user
+
+	permission view = owner + reader
+	permission edit = owner
+}
+
+/** A container of devices. */
+definition gerege/home {
+	relation owner: gerege/user
+	/** lives there, can operate devices */
+	relation resident: gerege/user
+	/** limited access */
+	relation guest: gerege/user
+
+	permission administrate = owner
+	permission operate = owner + resident
+	permission view = owner + resident + guest
+}
+
+/** A thermostat, lock or sensor. */
+definition gerege/device {
+	/** parent container */
+	relation home: gerege/home
+	/** direct grant, bypassing home membership */
+	relation operator: gerege/user
+	/** the device's own non-human identity */
+	relation self: gerege/system_principal
+
+	permission view = operator + home->view
+	permission operate = operator + home->operate
+
+	/**
+	 * Deliberately stricter than `operate`: a guest who may adjust the
+	 * thermostat must not be able to unlock the front door.
+	 */
+	permission operate_lock = operator + home->administrate
+
+	/** a device reporting its own readings */
+	permission push_telemetry = self
+}
+
+
+/**
+ * An autonomous agent acting on a user's behalf.
+ *
+ * An agent is deliberately neither an `application` nor a `system_principal`:
+ *
+ *   application       something a user consents to. Has no runtime behaviour of
+ *                     its own; it is a name on a consent screen.
+ *   system_principal  a non-human caller with no user behind it at all — a
+ *                     sensor reporting its own readings.
+ *   agent             a delegated actor. It has a human behind it, it decides
+ *                     at runtime which calls to make, and it must not inherit
+ *                     that human's authority just because it holds their token.
+ *
+ * The last clause is the whole reason this definition exists. An agent presents
+ * a token whose `sub` is the user, so every permission check would otherwise
+ * pass exactly as if the user had made the call themselves.
+ */
+definition gerege/agent {
+	/** the human this agent acts for */
+	relation controller: gerege/user
+
+	permission act = controller
+}
+
+/**
+ * One user's task-scoped delegation to one agent.
+ * Object ID pattern: `<user>|<agent>`.
+ *
+ * Separate from `consent_grant` because the two are grants to different kinds
+ * of actor, with different lifetimes:
+ *
+ *   consent_grant   to an application.  durable.   asked of the user once.
+ *   delegation      to an agent.        expiring.  asked of the user per task.
+ *
+ * Each actor kind gets exactly one of them. An agent-borne request is checked
+ * against a delegation and not additionally against a consent grant: delegation
+ * is the stricter grant in every dimension, and pairing a durable consent with
+ * an agent would reintroduce the standing privilege the expiry exists to
+ * prevent.
+ *
+ * Both still appear in a single end-to-end flow, at different hops — the
+ * application hop that asks the agent to act is consent-checked, and the
+ * agent's own downstream calls are delegation-checked.
+ */
+definition gerege/delegation {
+	/** the human who delegated */
+	relation delegator: gerege/user
+	/** the agent that was delegated to */
+	relation delegate: gerege/agent
+	/**
+	 * The capabilities delegated, one relationship each, each carrying its own
+	 * expiry. SpiceDB drops them when they lapse, so a forgotten grant is not a
+	 * standing privilege.
+	 */
+	relation granted: gerege/capability with expiration
+
+	permission includes = granted
+	permission revoke = delegator
+}

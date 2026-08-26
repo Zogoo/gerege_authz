@@ -1,0 +1,101 @@
+# The three objects that make the mesh check everything.
+#
+# Istio evaluates CUSTOM first, then DENY, then ALLOW. The MVP relies on that
+# order: the CUSTOM policy routes every request through ext-authz before any
+# other rule applies, so ext-authz is the decision point and not an advisory
+# second opinion.
+#
+# M-009: CUSTOM only. The cityos sample generated ALLOW, CUSTOM and DENY per
+# service through an operator, which is right at its scale and wrong at this
+# one — with four services the extra layers add configuration surface without
+# adding a demonstrable property, and every additional policy is another place a
+# demo failure can hide.
+
+# --------------------------------------------------------------------------
+# STRICT mTLS — this is what makes source.principal trustworthy
+# --------------------------------------------------------------------------
+# M-007 depends on it. Without STRICT, a plaintext caller would arrive with no
+# peer identity and the workload check would be decoration. Applied per
+# namespace rather than mesh-wide so the un-injected identity-plane components
+# (Keycloak, SpiceDB, the databases) are unaffected.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: strict-mtls
+  namespace: apps
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: strict-mtls
+  namespace: id
+spec:
+  selector:
+    matchLabels:
+      app: account-app
+  mtls:
+    mode: STRICT
+---
+# --------------------------------------------------------------------------
+# CUSTOM at the edge
+# --------------------------------------------------------------------------
+# Scoped by host on purpose. id.local.test is Keycloak, and sending the login
+# page through the authorizer that depends on Keycloak to authenticate anyone
+# would be circular.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: ext-authz-edge
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      istio: ingressgateway
+  action: CUSTOM
+  provider:
+    name: gerege-ext-authz
+  rules:
+    - to:
+        - operation:
+            hosts:
+              - profile.local.test
+              - smarthome.local.test
+              - account.local.test
+              - device.local.test
+---
+# --------------------------------------------------------------------------
+# CUSTOM on every application workload
+# --------------------------------------------------------------------------
+# No selector: the policy covers the whole namespace, so a service added later
+# is enforced before anyone remembers to configure it. Combined with
+# deny-by-default in the route document, a new service is secure before it
+# works rather than after (M-006).
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: ext-authz-apps
+  namespace: apps
+spec:
+  action: CUSTOM
+  provider:
+    name: gerege-ext-authz
+  rules:
+    - {}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: ext-authz-account
+  namespace: id
+spec:
+  selector:
+    matchLabels:
+      app: account-app
+  action: CUSTOM
+  provider:
+    name: gerege-ext-authz
+  rules:
+    - {}

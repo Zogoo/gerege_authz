@@ -1,0 +1,65 @@
+# The IoT device.
+#
+# Outside the mesh, in a namespace with no injection, reaching the system the
+# way a device on a home network would: through the ingress gateway, holding a
+# token it obtained for itself with the client-credentials grant. It has no
+# sidecar, no SPIFFE identity and no user behind it — mvp_docs/02 §4.4.
+#
+# Watch its log. Every cycle it makes one request it should be allowed and three
+# it should be refused. A device identity is not a skeleton key, and the log says
+# so without anyone having to take it on trust.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sensor-credentials
+  namespace: devices
+type: Opaque
+stringData:
+  client-secret: sensor-1-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-simulator
+  namespace: devices
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: telemetry-simulator }
+  template:
+    metadata:
+      labels: { app: telemetry-simulator }
+    spec:
+      containers:
+        - name: sensor
+          image: gerege/idp-mvp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/app/telemetry-simulator"]
+          env:
+            # The URLs carry the same hostnames a device on a home network would
+            # use, because the Host header is what the gateway routes on and what
+            # the authorizer matches rules against. GATEWAY_ADDR only replaces
+            # the DNS lookup: inside the cluster nothing resolves
+            # `id.local.test`, so the dialer is pointed at the gateway Service
+            # while the request itself stays unchanged.
+            - name: GATEWAY_ADDR
+              value: istio-ingressgateway.istio-system.svc.cluster.local:80
+            - name: TOKEN_URL
+              value: http://id.local.test/realms/gerege/protocol/openid-connect/token
+            - name: DEVICE_URL
+              value: http://device.local.test
+            - name: PROFILE_URL
+              value: http://profile.local.test
+            - name: CLIENT_ID
+              value: sensor-1
+            - name: CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: sensor-credentials, key: client-secret }
+            - name: DEVICE_ID
+              value: sensor-1
+            - name: OTHER_DEVICE_ID
+              value: thermostat-1
+            - name: INTERVAL
+              value: 20s
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }

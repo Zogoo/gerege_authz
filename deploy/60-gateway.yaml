@@ -1,0 +1,96 @@
+# North-south routing.
+#
+# Five hostnames, because SSO across *different origins* is the claim. Two
+# applications on one hostname would share a cookie and prove nothing about the
+# identity layer (mvp_docs/06 §3). The `.local.test` suffix avoids collision
+# with real domains and with mDNS `.local`, which macOS treats specially.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: gerege-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port: { number: 80, name: http, protocol: HTTP }
+      hosts:
+        - id.local.test
+        - profile.local.test
+        - smarthome.local.test
+        - account.local.test
+        - device.local.test
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: keycloak
+  namespace: id
+spec:
+  hosts: [id.local.test]
+  gateways: [istio-system/gerege-gateway]
+  http:
+    - route:
+        - destination:
+            host: keycloak.id.svc.cluster.local
+            port: { number: 8080 }
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: account-app
+  namespace: id
+spec:
+  hosts: [account.local.test]
+  gateways: [istio-system/gerege-gateway]
+  http:
+    - route:
+        - destination:
+            host: account-app.id.svc.cluster.local
+            port: { number: 80 }
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: profile-app
+  namespace: apps
+spec:
+  hosts: [profile.local.test]
+  gateways: [istio-system/gerege-gateway]
+  http:
+    - route:
+        - destination:
+            host: profile-app.apps.svc.cluster.local
+            port: { number: 80 }
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: smarthome-service
+  namespace: apps
+spec:
+  hosts: [smarthome.local.test]
+  gateways: [istio-system/gerege-gateway]
+  http:
+    - route:
+        - destination:
+            host: smarthome-service.apps.svc.cluster.local
+            port: { number: 80 }
+---
+# device-service is exposed only so that a device outside the mesh can reach
+# /telemetry, and so that Scenario 3c can be run: replaying a valid user token
+# straight at /internal/... from here is refused with `workload_not_registered`,
+# because the route's `callers` list contains smarthome-service and nothing else.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: device-service
+  namespace: apps
+spec:
+  hosts: [device.local.test]
+  gateways: [istio-system/gerege-gateway]
+  http:
+    - route:
+        - destination:
+            host: device-service.apps.svc.cluster.local
+            port: { number: 80 }
