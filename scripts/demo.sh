@@ -7,6 +7,7 @@
 #   scripts/demo.sh            all scenarios
 #   scripts/demo.sh 2 3b 5     the three a sceptical reviewer should ask for
 #   scripts/demo.sh 6          the agent
+#   scripts/demo.sh 7          onboarding and offboarding a device
 #   NOPAUSE=1 scripts/demo.sh  no keypresses
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -52,7 +53,7 @@ client_token() {
   | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p'
 }
 
-ZED=(zed --endpoint localhost:50051 --token gerege-mvp-key --insecure)
+ZED=(zed --endpoint localhost:50051 --token gerege-mvp-key --insecure --skip-version-check)
 zed_up()   { port_forward id svc/spicedb 50051:50051 >/dev/null; }
 zed_down() { cleanup_port_forwards; }
 
@@ -393,9 +394,112 @@ for s in d.get('steps') or []:
   zed_down; pause
 }
 
+
+scenario_7() {
+  say "Scenario 7 — onboarding and offboarding a device   (lifecycle)"
+  why "A device that does not exist yet, made real by one command, and unmade by another."
+
+  local DEV=sensor-demo
+
+  # Leave no trace of a previous run.
+  ./scripts/lifecycle.sh offboard-device "$DEV" >/dev/null 2>&1 || true
+
+  echo; cmd "make inventory   — what exists, and who answers for it"
+  ./scripts/lifecycle.sh inventory 2>/dev/null | sed 's/^/  /'
+  why "Every non-human identity has a named operator. The command exits non-zero if one does not,"
+  why "so this belongs in CI as much as in a terminal."
+  pause
+
+  echo; cmd "$DEV asks for a token — it does not exist yet"
+  local tok
+  tok=$(client_token "$DEV" "$DEV-secret")
+  if [[ -z "$tok" ]]; then
+    printf '    %s DENIED   %s no such client%s\n' "$RED" "$DIM" "$R"
+  else
+    printf '    %s unexpectedly got a token%s\n' "$RED" "$R"
+  fi
+  pause
+
+  echo; cmd "note the authorizer before we touch anything"
+  local before
+  before=$(k -n id get pods -l app=ext-authz \
+    -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount --no-headers)
+  echo "      $before"
+  pause
+
+  echo; cmd "make onboard-device NAME=$DEV OPERATOR=alice"
+  ./scripts/lifecycle.sh onboard-device "$DEV" alice alice-home 2>&1 | sed 's/^/  /'
+  why "Four systems — Keycloak, the authorizer's registry, SpiceDB, and a credential — in one"
+  why "command that verifies rather than assumes. It asks SpiceDB whether the device can actually"
+  why "do the one thing it exists to do, and whether the operator is really recorded, before"
+  why "reporting success."
+  pause
+
+  echo; cmd "the same authorizer, after"
+  local after
+  after=$(k -n id get pods -l app=ext-authz \
+    -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount --no-headers)
+  echo "      $after"
+  if [[ "$before" == "$after" ]]; then
+    printf '\n    %s✓ same pod, same restart count — registering a device did not interrupt authorization%s\n' "$GRN" "$R"
+  else
+    printf '\n    %s✗ the authorizer restarted%s\n' "$RED" "$R"
+  fi
+  why "It re-reads its configuration on a timer and swaps it atomically. A configuration that"
+  why "fails to compile is never installed — the previous one keeps serving."
+  pause
+
+  echo; cmd "$DEV asks for a token again"
+  tok=$(client_token "$DEV" "$DEV-secret")
+  [[ -n "$tok" ]] && printf '    %s✓%s obtained by client_credentials\n' "$GRN" "$R" \
+                  || printf '    %s✗%s still no token\n' "$RED" "$R"
+  echo; cmd "POST /telemetry/$DEV      — its own readings"
+  req POST "http://device.local.test/telemetry/$DEV" "$tok" '{"temperature":19.7,"humidity":41}'
+  echo; cmd "POST /telemetry/sensor-1  — somebody else's"
+  req POST "http://device.local.test/telemetry/sensor-1" "$tok" '{"temperature":19.7}'
+  why "Onboarding granted exactly one relationship. The device is not a skeleton key the moment"
+  why "it is born, which is the usual failure of provisioning scripts."
+  pause
+
+  echo; cmd "make inventory   — the new device, and who answers for it"
+  ./scripts/lifecycle.sh inventory 2>/dev/null | sed 's/^/  /'
+  pause
+
+  echo; cmd "capture a token, then decommission the device while that token is still valid"
+  local doomed
+  doomed=$(client_token "$DEV" "$DEV-secret")
+  printf '      token captured, %s seconds of life left\n' \
+    "$(echo "$doomed" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null \
+       | python3 -c "import sys,json,time;print(int(json.load(sys.stdin)['exp']-time.time()))" 2>/dev/null || echo '~300')"
+  pause
+
+  echo; cmd "make offboard-device NAME=$DEV"
+  ./scripts/lifecycle.sh offboard-device "$DEV" 2>&1 | sed 's/^/  /'
+  why "Relationships first. That is the moment it stops working — disabling the Keycloak client"
+  why "and cleaning the registry afterwards is tidying, not the kill switch."
+  pause
+
+  echo; cmd "replay the still-valid token"
+  req POST "http://device.local.test/telemetry/$DEV" "$doomed" '{"temperature":19.7}'
+  why "A genuine token, correct signature, minutes of validity remaining — and useless, because"
+  why "its authority was never in it. Nothing waited for an expiry and nothing had to reach the device."
+  pause
+
+  echo; cmd "make inventory   — back to where we started"
+  ./scripts/lifecycle.sh inventory 2>/dev/null | sed 's/^/  /'
+  why ""
+  why "What this scenario does NOT show: the device never proved it was itself. Onboarding is"
+  why "operator-driven and the credential is a shared secret delivered out of band — a fleet"
+  why "pattern, not a consumer one. A user-claimed device would use the OAuth 2.0 device"
+  why "authorization grant: the device shows a code or a QR, the owner approves, and ownership is"
+  why "proven by that authentication rather than asserted by whoever ran the command."
+  why "See docs/lifecycle.md §7."
+  pause
+}
+
 main() {
   local want=("$@")
-  [[ ${#want[@]} -eq 0 ]] && want=(1 2 3a 3b 3c 4 5 6)
+  [[ ${#want[@]} -eq 0 ]] && want=(1 2 3a 3b 3c 4 5 6 7)
   local s
   for s in "${want[@]}"; do
     case "$s" in
@@ -408,6 +512,7 @@ main() {
       4)  scenario_4 ;;
       5)  scenario_5 ;;
       6)  scenario_6 ;;
+      7)  scenario_7 ;;
       *)  die "unknown scenario '$s' (try: 1 2 3a 3b 3c 4 5)" ;;
     esac
   done

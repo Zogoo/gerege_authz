@@ -19,64 +19,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gerege/idp-mvp/internal/catalogue"
 	"github.com/gerege/idp-mvp/internal/logx"
 	"github.com/gerege/idp-mvp/internal/spicedb"
 	"github.com/gerege/idp-mvp/internal/svc"
 	"github.com/gerege/idp-mvp/internal/webui"
 )
 
-// capabilityCatalogue turns an object id into something a person can decide
-// about. mvp_docs/03 §2 keeps capabilities as SpiceDB objects so that adding
-// one is data rather than a schema rollout; the wording that goes in front of
-// the user lives here, next to the screen that shows it.
-var capabilityCatalogue = map[string]string{
-	"profile_read":    "See your name, email, phone and address",
-	"profile_write":   "Update your address and phone number",
-	"devices_view":    "See the devices in your home and their state",
-	"devices_control": "Turn your devices on and off",
-	"devices_unlock":  "Lock and unlock your doors",
-}
-
-// applicationCatalogue names the consent counterparty. Alice consents to
-// "Smart Home", the product — not to a pod (docs/09 §2).
-var applicationCatalogue = map[string]string{
-	"smarthome-app": "Smart Home",
-	"profile-app":   "Profile App",
-	"account-app":   "Account Console",
-}
-
-// bundles are what an application asks for when a user starts from the account
-// page rather than from a challenge.
-var bundles = map[string][]string{
-	"smarthome-app": {"profile_read", "devices_view", "devices_control", "devices_unlock"},
-}
-
-// agentCatalogue names the delegated actors a user can grant authority to.
-var agentCatalogue = map[string]string{"assistant": "Assistant"}
-
-// agentBundles are the capabilities an agent may be delegated. devices_unlock
-// is absent on purpose: it is a step-up capability, and a route that requires a
-// person to authenticate is one an agent must not be able to walk through, so
-// offering to delegate it would be offering something that cannot work.
-var agentBundles = map[string][]string{
-	"assistant": {"profile_read", "devices_view", "devices_control"},
-}
-
-// delegationTTLs are the durations a person can choose from. There is no
-// "forever" — a delegation that does not expire is a standing privilege, which
-// is the failure mode the whole mechanism exists to prevent.
-var delegationTTLs = []struct {
-	Label string
-	TTL   time.Duration
-}{
-	{"5 minutes", 5 * time.Minute},
-	{"1 hour", time.Hour},
-	{"8 hours", 8 * time.Hour},
-}
-
-var writer *spicedb.Writer
+var (
+	writer *spicedb.Writer
+	cat    *catalogue.Catalogue
+)
 
 func main() {
+	c, err := catalogue.Load(svc.Env("CATALOGUE_PATH", "/etc/gerege/catalogue.yaml"))
+	if err != nil {
+		// The console cannot ask a person to approve something it cannot
+		// describe. Refusing to start beats rendering capability ids at a user.
+		logx.Error("refusing to start: catalogue is not usable", "err", err.Error())
+		panic(err)
+	}
+	cat = c
+
 	w, err := spicedb.NewWriter(
 		svc.Env("SPICEDB_ENDPOINT", "spicedb.id.svc.cluster.local:50051"),
 		svc.Env("SPICEDB_TOKEN", "gerege-mvp-key"),
@@ -98,6 +62,7 @@ func main() {
 	mux.HandleFunc("/delegate", delegateScreen)
 	mux.HandleFunc("/delegations", createDelegation)
 	mux.HandleFunc("/undelegate", withdrawDelegation)
+	mux.HandleFunc("/decommission", decommission)
 	svc.Run("account-app", svc.Env("ADDR", ":8080"), svc.Env("HEALTH_ADDR", ":8081"), mux)
 }
 
@@ -179,8 +144,40 @@ remember to remove them, which is what stops a task grant from quietly becoming 
 	}
 	agentBody.WriteString(webui.Links("/delegate?agent=assistant", "Delegate to the Assistant →"))
 
+	owned, err := writer.OwnedBy(r.Context(), id.UserID)
+	if err != nil {
+		svc.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	var ownBody strings.Builder
+	if len(owned) == 0 {
+		ownBody.WriteString(`<p>You are not the operator of anything.</p>`)
+	} else {
+		sort.Slice(owned, func(i, j int) bool { return owned[i].ID < owned[j].ID })
+		ownBody.WriteString(`<table><tr><th>Identity</th><th>Kind</th><th></th></tr>`)
+		for _, o := range owned {
+			kind, name := "device", displayAgent(o.ID)
+			if o.Type == "gerege/agent" {
+				kind = "agent"
+			} else {
+				name = o.ID
+			}
+			fmt.Fprintf(&ownBody, `<tr><td>%s <span class="tag">%s</span></td><td>%s</td>
+<td><form method="post" action="/decommission">
+<input type="hidden" name="type" value="%s"><input type="hidden" name="id" value="%s">
+<button class="danger">Decommission</button></form></td></tr>`,
+				webui.Esc(name), webui.Esc(o.ID), kind, webui.Esc(o.Type), webui.Esc(o.ID))
+		}
+		ownBody.WriteString(`</table>`)
+	}
+	ownBody.WriteString(`<p class="note">Nothing non-human acts unowned. Every agent and every
+device has a named operator who answers for what it does and is the only one who may
+decommission it — accountability is a relationship, not a spreadsheet.</p>`)
+
 	page := webui.Card("Applications with access to your data", body.String())
 	page += webui.Card("Agents acting on your behalf", agentBody.String())
+	page += webui.Card("Non-human identities you operate", ownBody.String())
 	page += webui.Card("Grant access", fmt.Sprintf(
 		`<p>You can also grant consent before an application asks for it.</p>%s`,
 		webui.Links("/consent?application=smarthome-app", "Review Smart Home's request →")))
@@ -200,7 +197,10 @@ func consent(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	requested := bundles[app]
+	var requested []string
+	if p, ok := cat.Application(app); ok {
+		requested = p.Requests
+	}
 	if c := q.Get("capability"); c != "" && !contains(requested, c) {
 		requested = append([]string{c}, requested...)
 	}
@@ -247,7 +247,7 @@ func delegateScreen(w http.ResponseWriter, r *http.Request) {
 	if agent == "" {
 		agent = "assistant"
 	}
-	requested := agentBundles[agent]
+	requested, refusedSensitive := cat.Delegatable(agent)
 	asked := q.Get("capability")
 
 	var checks strings.Builder
@@ -277,7 +277,7 @@ can already do yourself — delegating decides which of it the agent may do, and
 <a class="btn" href="/">Cancel</a></div></form>`,
 		webui.Esc(agent), webui.Esc(q.Get("return_to")), checks.String(), ttlChooser()))
 
-	if asked != "" && !contains(requested, asked) {
+	if asked != "" && contains(refusedSensitive, asked) {
 		body += webui.Card("Not available to delegate", fmt.Sprintf(
 			`<p>%s The agent asked for <code>%s</code>, which cannot be delegated: it requires a
 person to authenticate at the moment of use, and an agent cannot re-authenticate you.</p>
@@ -296,13 +296,13 @@ Do it yourself in the smart-home app.</p>`,
 func ttlChooser() string {
 	var b strings.Builder
 	b.WriteString(`<div class="row">`)
-	for i, t := range delegationTTLs {
+	for i, t := range cat.DelegationTTLs {
 		checked := ""
 		if i == 0 {
 			checked = " checked"
 		}
 		fmt.Fprintf(&b, `<label><input type="radio" name="ttl" value="%s"%s> %s</label>`,
-			t.TTL.String(), checked, webui.Esc(t.Label))
+			t.Value.String(), checked, webui.Esc(t.Label))
 	}
 	b.WriteString(`</div>`)
 	return b.String()
@@ -326,7 +326,7 @@ func createDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only what this agent is allowed to be asked for. A form field is not a
 	// place to widen an agent's reach.
-	allowed := agentBundles[agent]
+	allowed, _ := cat.Delegatable(agent)
 	for _, c := range caps {
 		if !contains(allowed, c) {
 			svc.WriteError(w, http.StatusBadRequest, "capability cannot be delegated: "+c)
@@ -335,7 +335,24 @@ func createDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	ttl, err := time.ParseDuration(r.FormValue("ttl"))
 	if err != nil || ttl <= 0 || ttl > 24*time.Hour {
-		ttl = delegationTTLs[0].TTL
+		ttl = cat.DelegationTTLs[0].Value
+	}
+
+	// Enrolment is checked here as well as on the request path. A delegation to
+	// an agent that was never enrolled to act for you is a grant that can never
+	// be used; refusing to write it beats letting someone believe they granted
+	// something.
+	enrolled, err := writer.EnrolledFor(r.Context(), agent, id.UserID)
+	if err != nil {
+		svc.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !enrolled {
+		logx.Error("delegation refused: agent is not enrolled for this user",
+			"principal", id.UserID, "agent", agent)
+		svc.WriteError(w, http.StatusForbidden,
+			"this agent is not enrolled to act for you; ask its operator to enrol it first")
+		return
 	}
 
 	// The delegator is always the authenticated principal, exactly as for
@@ -380,11 +397,56 @@ func withdrawDelegation(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func displayAgent(a string) string {
-	if d, ok := agentCatalogue[a]; ok {
-		return d
+func displayAgent(a string) string { return cat.DisplayAgent(a) }
+
+// decommission removes a non-human identity's authority.
+//
+// Gated on `administrate`, which only the operator holds. This is the point of
+// recording an operator at all: somebody specific can turn the thing off, and
+// the graph knows who that is.
+//
+// Deleting the relationships is the whole of it. Whatever token the thing holds
+// keeps its signature and its expiry and becomes useless on the next request,
+// because authority was never in the token.
+func decommission(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		svc.WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
 	}
-	return a
+	if err := r.ParseForm(); err != nil {
+		svc.WriteError(w, http.StatusBadRequest, "malformed form")
+		return
+	}
+	id := webui.From(r)
+	resourceType, target := r.FormValue("type"), r.FormValue("id")
+	if resourceType != "gerege/agent" && resourceType != "gerege/system_principal" {
+		svc.WriteError(w, http.StatusBadRequest, "unsupported identity type")
+		return
+	}
+	if target == "" {
+		svc.WriteError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+
+	operates, err := writer.Operates(r.Context(), resourceType, target, id.UserID)
+	if err != nil {
+		svc.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !operates {
+		logx.Error("decommission refused: not the operator",
+			"principal", id.UserID, "type", resourceType, "id", target)
+		svc.WriteError(w, http.StatusForbidden, "only the operator may decommission this")
+		return
+	}
+
+	if err := writer.Decommission(r.Context(), resourceType, target); err != nil {
+		logx.Error("decommission failed", "err", err.Error(), "type", resourceType, "id", target)
+		svc.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	logx.Info("decommissioned", "principal", id.UserID, "type", resourceType, "id", target)
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // remaining renders how long an agent's authority has left, which is the thing
@@ -483,19 +545,9 @@ func isSafeReturn(raw string) bool {
 	return false
 }
 
-func describe(capability string) string {
-	if d, ok := capabilityCatalogue[capability]; ok {
-		return d
-	}
-	return capability
-}
+func describe(capability string) string { return cat.Describe(capability) }
 
-func displayApp(app string) string {
-	if d, ok := applicationCatalogue[app]; ok {
-		return d
-	}
-	return app
-}
+func displayApp(app string) string { return cat.DisplayApplication(app) }
 
 func contains(xs []string, v string) bool {
 	for _, x := range xs {

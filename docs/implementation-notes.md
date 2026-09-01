@@ -188,7 +188,99 @@ deterministic. It is the same reasoning as M-005, applied to time instead of cac
 
 ---
 
-## 10. Things that went wrong during the build, kept as warnings
+## 10. Ownership, and making it load-bearing
+
+The first agent implementation gave the agent a `controller` relation and the
+device nothing at all — which violated the project's own design doc
+([docs/09 §4](../../docs/09-zero-trust-enforcement-and-consent.md) rule 2:
+"every system principal has a named human operator") while quoting it in a
+comment two lines above. The device could act; the graph could not say who was
+answerable for it.
+
+Fixing it properly meant deciding *where* ownership is enforced, and the answer
+is different for each of the three questions it raises.
+
+| Question | Where it is answered | Why not elsewhere |
+|---|---|---|
+| Is this thing owned at all? | onboarding, and `make inventory` in CI | Not expressible as a single permission check — "does an operator exist" has no subject to ask about. And it is a registration invariant, not a fact about a request |
+| May this agent act for *this* user? | per request, `agent:X#act_for@user:sub` | It **is** a fact about the request: two named parties, and their pairing may or may not have been intended |
+| May this person decommission it? | write path, `administrate` | Only the operator holds it. This is the point of recording an operator at all |
+
+Renaming `controller` into `operator` + `enrolled_for` also produced the first
+real schema migration: SpiceDB refuses to remove a relation while relationships
+exist under it. That is the right behaviour — a schema change that silently
+dropped authorization data would be a policy change nobody reviewed — so retired
+relations are listed explicitly in `scripts/seed.sh` and their relationships
+deleted first.
+
+---
+
+## 11. Read-your-writes, in the other direction
+
+[§9](#9-expiry-is-observed-at-a-revision-not-at-a-wall-clock) was about a check
+seeing a relationship for too long. The onboarding scripts hit the mirror image:
+a check that verified a *just-written* relationship reported failure, because
+`zed`'s default consistency reads at a quantized revision and the write was not
+visible yet.
+
+Both are the same fact from opposite sides — a check is evaluated at a revision,
+not at an instant — and both have the same fix. Every verification that follows a
+write passes `--consistency-full`. Anything less would report a correct
+onboarding as a failure, and would eventually report a failed one as a success.
+
+---
+
+## 12. Onboarding must converge, not merely observe
+
+Offboarding disables a Keycloak client rather than deleting it, so a
+re-onboarded device meets an existing-but-disabled identity. The first version
+treated the resulting `409 Conflict` as success — and reported a working device
+that could not obtain a token, because "already exists" is not "already correct".
+
+Registration is now an upsert that ends by *asking Keycloak whether the client is
+enabled*, rather than assuming the write landed. The general form: a provisioning
+step that reports success without verifying the state it claims to have created
+is a step that will eventually lie.
+
+---
+
+## 13. `at_least_as_fresh` cost more than it bought
+
+Telemetry ingest was the one route configured `at_least_as_fresh` rather than
+`fully_consistent`, on the reasoning that it is high-frequency and no assertion
+depended on observing a revocation there ([§5](#5-consistency-at_least_as_fresh-needs-a-zedtoken-from-somewhere)).
+
+That was wrong, and assertion A25 caught it: telemetry is the one route a
+*device* uses, so it is exactly the route where decommissioning has to bite
+immediately. Reading at a slightly stale revision let a captured token keep
+working after its own device had been decommissioned — the single property the
+whole offboarding design exists to provide.
+
+It is now `fully_consistent` like everything else. The implementation and its
+ZedToken tracking stay in `internal/spicedb`, unused: the seam is worth keeping,
+the configuration is not.
+
+The general shape: "no assertion depends on this" is a statement about the tests,
+not about the system. It was true when written and stopped being true the moment
+offboarding existed.
+
+---
+
+## 14. Waiting for the right event, not a similar one
+
+Onboarding waits for the authorizer to reload before reporting success. The first
+version grepped the last 90 seconds of log for `configuration reloaded` — which
+cheerfully matched a *previous* reload and returned immediately, before the new
+registry was live. The symptom appeared much later and somewhere else: a freshly
+onboarded device refused with `unknown_application`.
+
+It now records a timestamp before writing the ConfigMap and only accepts a reload
+after it. A wait that can be satisfied by an event from before the thing it is
+waiting for is not a wait.
+
+---
+
+## 15. Things that went wrong during the build, kept as warnings
 
 These cost time and would cost it again.
 
@@ -222,6 +314,13 @@ strategy is `IGNORE_EXISTING`, so adding `assistant-agent` to `realm-gerege.json
 restarting Keycloak changes nothing at all, silently. The realm has to be deleted first —
 which is fine here, because every piece of realm state is in the file, and is exactly the
 sort of thing that is obvious in hindsight and costs an hour in the moment.
+
+**`zed` writes operational notices to stderr, and a new patch release broke a
+bootstrap.** The seed checks compared `$(zed permission check ... 2>&1)` against
+`"true"`. When SpiceDB 1.56.1 shipped, `zed` began prefixing every invocation
+with an out-of-date warning, which the `2>&1` folded into the compared value —
+turning an upstream release into a bootstrap failure with a baffling error. Never
+merge stderr into a value you are going to compare.
 
 **`zed validate` and `zed import` disagree about prefixes.** The assertion suite in
 `validation.yaml` uses fully-prefixed names and passes; `zed import` does not accept the

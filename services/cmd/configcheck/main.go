@@ -13,8 +13,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/gerege/idp-mvp/internal/catalogue"
 	"github.com/gerege/idp-mvp/internal/config"
 	"github.com/gerege/idp-mvp/internal/routes"
 )
@@ -32,7 +34,7 @@ var probes = []struct {
 	{"smarthome.local.test", "POST", "/home/alice-home/devices/lock-1/unlock", "edge check: coarse, on the home"},
 	{"device-service.apps.svc.cluster.local", "POST", "/internal/devices/lock-1/unlock", "internal hop: operate_lock on the device"},
 	{"device-service.apps.svc.cluster.local", "POST", "/internal/devices/thermostat-1/state", "thermostat needs only operate"},
-	{"device.local.test", "POST", "/telemetry/sensor-1", "device identity — no consent, no peer identity"},
+	{"device.local.test", "POST", "/telemetry/sensor-1", "device identity — no consent, no peer identity, revocation immediate"},
 	{"account.local.test", "POST", "/revoke", "consent revocation"},
 	{"profile.local.test", "GET", "/undeclared", "no rule → default deny"},
 	{"anything.example.com", "GET", "/internal/devices/lock-1", "unknown host still matches the unscoped device rule"},
@@ -45,6 +47,10 @@ func main() {
 	path := "config/ext-authz.yaml"
 	if len(os.Args) > 1 {
 		path = os.Args[1]
+	}
+	catPath := filepath.Join(filepath.Dir(path), "catalogue.yaml")
+	if len(os.Args) > 2 {
+		catPath = os.Args[2]
 	}
 
 	cfg, err := config.Load(path)
@@ -96,9 +102,71 @@ func main() {
 		}
 		fmt.Println()
 	}
+	if !crossCheck(cfg, catPath) {
+		os.Exit(1)
+	}
 	if failed {
 		os.Exit(1)
 	}
+}
+
+// crossCheck holds the two configuration documents to each other.
+//
+// `sensitive` in the catalogue and `stepUp` in the route config describe the
+// same boundary from two sides: what a person is told requires their presence,
+// and what the authorizer actually refuses without it. Nothing keeps them
+// aligned except this check, and a capability marked sensitive but not enforced
+// is a promise the system does not keep.
+func crossCheck(cfg *config.Config, catPath string) bool {
+	cat, err := catalogue.Load(catPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "\ncatalogue is not usable — the account console would refuse to start:")
+		fmt.Fprintln(os.Stderr, "  "+err.Error())
+		return false
+	}
+
+	guarded := map[string]bool{}
+	declared := map[string]bool{}
+	for i := range cfg.Rules {
+		r := &cfg.Rules[i]
+		if r.Capability != "" {
+			declared[r.Capability] = true
+		}
+		if r.StepUp {
+			guarded[r.Capability] = true
+		}
+	}
+
+	ok := true
+	fmt.Printf("\n%s\n", catPath)
+	for _, cap := range cat.Capabilities {
+		note := ""
+		switch {
+		case cap.Sensitive && !guarded[cap.ID]:
+			note = "  ✗ marked sensitive but no route enforces stepUp"
+			ok = false
+		case !cap.Sensitive && guarded[cap.ID]:
+			note = "  ✗ a route enforces stepUp but the catalogue does not call it sensitive"
+			ok = false
+		case cap.Sensitive:
+			note = "  sensitive · step-up enforced · never delegatable"
+		case !declared[cap.ID]:
+			note = "  (no route uses this capability yet)"
+		}
+		fmt.Printf("  %-18s %s%s\n", cap.ID, cap.Display, note)
+	}
+
+	for _, a := range cat.Agents {
+		allowed, refused := cat.Delegatable(a.Name)
+		fmt.Printf("\n  agent %q may be delegated: %s\n", a.Name, strings.Join(allowed, ", "))
+		if len(refused) > 0 {
+			fmt.Printf("  agent %q may never be delegated: %s   (step-up)\n", a.Name, strings.Join(refused, ", "))
+		}
+	}
+	if !ok {
+		fmt.Fprintln(os.Stderr, "\nthe catalogue and the route configuration disagree about which capabilities are sensitive")
+	}
+	return ok
 }
 
 func describe(r *config.Rule) string {

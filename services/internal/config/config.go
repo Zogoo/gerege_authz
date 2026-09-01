@@ -107,6 +107,17 @@ type Agent struct {
 	Name string `yaml:"name"`
 	// Object is the gerege/agent object id.
 	Object string `yaml:"object"`
+	// Workload is the SPIFFE identity of the process that runs this agent.
+	//
+	// It binds the two halves that were previously checked independently: the
+	// workload (non-forgeable, from mTLS) and the actor (a bearer claim). A
+	// process registered here may present *only* this agent's token — it cannot
+	// decline to exchange and act as the application whose token it was handed,
+	// which would bypass delegation and step-up entirely.
+	//
+	// Empty means unbound, which is permitted but should be rare: it leaves the
+	// agent's token acceptable from any workload.
+	Workload string `yaml:"workload"`
 	// DisplayName is shown on the delegation screen.
 	DisplayName string `yaml:"displayName"`
 }
@@ -316,6 +327,19 @@ func (c *Config) AppForHost(host string) (*Application, bool) {
 			if strings.ToLower(h) == host {
 				return &c.Applications[i], true
 			}
+		}
+	}
+	return nil, false
+}
+
+// AgentByWorkload returns the agent a calling workload is bound to run.
+func (c *Config) AgentByWorkload(spiffeID string) (*Agent, bool) {
+	if spiffeID == "" {
+		return nil, false
+	}
+	for i := range c.Agents {
+		if c.Agents[i].Workload != "" && c.Agents[i].Workload == spiffeID {
+			return &c.Agents[i], true
 		}
 	}
 	return nil, false

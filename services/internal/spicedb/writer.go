@@ -332,3 +332,137 @@ func (w *Writer) Delegations(ctx context.Context, subject string) ([]Delegation,
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------------------
+// ownership — every non-human identity answers to a person
+// ---------------------------------------------------------------------------
+
+// Owned is one non-human identity a person is accountable for.
+type Owned struct {
+	// Type is gerege/agent or gerege/system_principal.
+	Type string
+	// ID is the object id — `assistant`, `sensor-1`.
+	ID string
+}
+
+// OwnedBy lists the agents and system principals a user operates.
+//
+// docs/09 §4 rule 2: accountability is a relationship, not a spreadsheet. This
+// is the query that makes that true rather than aspirational — "what am I
+// answerable for" has an answer, and it comes from the same graph that decides
+// everything else.
+func (w *Writer) OwnedBy(ctx context.Context, subject string) ([]Owned, error) {
+	ctx, cancel := context.WithTimeout(ctx, w.timeout)
+	defer cancel()
+
+	var out []Owned
+	for _, resourceType := range []string{"gerege/agent", "gerege/system_principal"} {
+		stream, err := w.c.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
+			Consistency: &v1.Consistency{Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true}},
+			RelationshipFilter: &v1.RelationshipFilter{
+				ResourceType:     resourceType,
+				OptionalRelation: "operator",
+				OptionalSubjectFilter: &v1.SubjectFilter{
+					SubjectType:       "gerege/user",
+					OptionalSubjectId: subject,
+				},
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		for {
+			msg, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Owned{Type: resourceType, ID: msg.GetRelationship().GetResource().GetObjectId()})
+		}
+	}
+	return out, nil
+}
+
+// EnrolledFor reports whether an agent may act for a user at all.
+//
+// Checked on the write path as well as the request path. A delegation to an
+// agent that was never enrolled for you would be a grant that can never be
+// used — better to refuse to create it than to let someone believe they granted
+// something.
+func (w *Writer) EnrolledFor(ctx context.Context, agent, subject string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, w.timeout)
+	defer cancel()
+	resp, err := w.c.CheckPermission(ctx, &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true}},
+		Resource:    &v1.ObjectReference{ObjectType: "gerege/agent", ObjectId: agent},
+		Permission:  "act_for",
+		Subject: &v1.SubjectReference{
+			Object: &v1.ObjectReference{ObjectType: "gerege/user", ObjectId: subject},
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return resp.GetPermissionship() == v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION, nil
+}
+
+// Operates reports whether a user is the accountable operator of a non-human
+// identity — the check that gates decommissioning.
+func (w *Writer) Operates(ctx context.Context, resourceType, id, subject string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, w.timeout)
+	defer cancel()
+	resp, err := w.c.CheckPermission(ctx, &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true}},
+		Resource:    &v1.ObjectReference{ObjectType: resourceType, ObjectId: id},
+		Permission:  "administrate",
+		Subject: &v1.SubjectReference{
+			Object: &v1.ObjectReference{ObjectType: "gerege/user", ObjectId: subject},
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return resp.GetPermissionship() == v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION, nil
+}
+
+// Decommission removes every relationship naming a non-human identity — its
+// ownership, its enrolments, and for an agent every delegation made to it.
+//
+// Deletion is the whole mechanism. Whatever credential the thing holds keeps
+// its signature and its expiry and stops working on the next request, because
+// its authority was never in the credential.
+func (w *Writer) Decommission(ctx context.Context, resourceType, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, w.timeout)
+	defer cancel()
+
+	if _, err := w.c.DeleteRelationships(ctx, &v1.DeleteRelationshipsRequest{
+		RelationshipFilter: &v1.RelationshipFilter{
+			ResourceType:       resourceType,
+			OptionalResourceId: id,
+		},
+	}); err != nil {
+		return err
+	}
+
+	if resourceType == "gerege/agent" {
+		// Delegations name the agent as a subject, so they are not caught by the
+		// filter above. Leaving them would be harmless — the enrolment check
+		// refuses first — but a decommissioned agent should not still appear on
+		// somebody's account page as holding authority.
+		if _, err := w.c.DeleteRelationships(ctx, &v1.DeleteRelationshipsRequest{
+			RelationshipFilter: &v1.RelationshipFilter{
+				ResourceType:     "gerege/delegation",
+				OptionalRelation: "delegate",
+				OptionalSubjectFilter: &v1.SubjectFilter{
+					SubjectType:       "gerege/agent",
+					OptionalSubjectId: id,
+				},
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}

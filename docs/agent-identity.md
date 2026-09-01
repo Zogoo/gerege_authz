@@ -25,7 +25,44 @@ That is the whole of it. The rest of this document is the consequence.
 
 ---
 
-## 2. Four actor kinds, not three
+## 2. Nothing non-human acts unowned
+
+Before anything else: an agent and a device both act for people, so both answer
+to one.
+
+```zed
+definition gerege/system_principal {
+	relation operator: gerege/user          // who answers for this device
+	permission administrate = operator
+}
+
+definition gerege/agent {
+	relation operator: gerege/user          // who answers for this agent
+	relation enrolled_for: gerege/user      // which users it may act for
+	permission administrate = operator
+	permission act_for = enrolled_for
+}
+```
+
+`operator` and `enrolled_for` are deliberately different questions. A platform
+assistant may be operated by one team and enrolled for thousands of customers;
+the operator is answerable for it, the enrolled users are the ones it may act
+for. Conflating them would force every user of a shared agent to become
+accountable for it.
+
+**`act_for` is checked on every agent request.** Without it, an agent enrolled
+for Alice could be handed Bob's token and would act for Bob — the delegation
+check alone would not catch that, because a delegation names a user and an agent
+but says nothing about whether that pairing was ever intended.
+
+**`administrate` gates decommissioning.** That is the point of recording an
+operator at all: somebody specific can turn the thing off, and the graph knows
+who. Onboarding refuses to create an unowned identity and `make inventory` fails
+if one appears — see [lifecycle.md](lifecycle.md).
+
+---
+
+## 3. Four actor kinds, not three
 
 | Kind | Human behind it | Decides at runtime | Grant that binds it |
 |---|---|---|---|
@@ -40,11 +77,6 @@ own readings, with no user in the loop at all. An agent has a human behind it *a
 decides for itself — which is exactly the combination nothing else in the model covers.
 
 ```zed
-definition gerege/agent {
-	relation controller: gerege/user
-	permission act = controller
-}
-
 definition gerege/delegation {
 	relation delegator: gerege/user
 	relation delegate: gerege/agent
@@ -60,7 +92,7 @@ delegation nobody remembers to remove stops working anyway.
 
 ---
 
-## 3. How an agent gets an identity
+## 4. How an agent gets an identity
 
 RFC 8693 token exchange, which Keycloak calls *standard token exchange*:
 
@@ -92,19 +124,20 @@ assumed. So ext-authz reconstructs the actor from `azp` plus the agent registry.
 That is sufficient for one hop and only one hop. A chain of agents would need `act`, and
 the known attack on chains — *delegation chain splicing*, inserting yourself between two
 legitimate hops — is exactly what an unauthenticated reconstruction cannot detect. The
-MVP has one agent and says so; see [§7](#7-what-this-does-not-solve).
+MVP has one agent and says so; see [§9](#9-what-this-does-not-solve).
 
 ---
 
-## 4. The decision
+## 5. The decision
 
 An agent-borne request runs the same pipeline as anything else, with two additions:
 
 ```
  ├─ 2. principal ← sub (the human)      actor ← azp (the agent)
- ├─ 5. workload registered?
+ ├─ 3. workload bound to the actor it presents?
+ ├─ 5. workload registered for this route?
  ├─ 6. step-up gate          sensitive capability → a human must be present
- └─ 7. CheckBulkPermissions [ permission, delegation ]
+ └─ 7. CheckBulkPermissions [ permission, enrolment, delegation ]
 ```
 
 **Delegation replaces consent for an agent; it does not add to it.** Each actor kind gets
@@ -126,7 +159,35 @@ The boundary in the decision log is precisely where the token exchange happened.
 
 ---
 
-## 5. Step-up: the one an agent can never pass
+## 6. The binding between workload and actor
+
+mTLS proves which process is calling and cannot be forged by a compromised peer.
+The token only *claims* what it is acting as. Checking them independently left a
+hole that took the whole mechanism with it:
+
+agent-runner receives Alice's application token in order to exchange it. If it
+simply **forwards** that token instead, it stops being an agent as far as the
+authorizer is concerned. It becomes the application — consent-scoped access, no
+delegation check, no step-up gate. Every constraint on the agent was opt-in from
+the agent's own side, which is no constraint at all for the component most
+exposed to prompt injection.
+
+```yaml
+agents:
+  - name: assistant-agent
+    object: assistant
+    workload: spiffe://cluster.local/ns/apps/sa/agent-runner
+```
+
+The binding runs in both directions, before any permission question is asked:
+
+- a workload registered to run an agent may present **only** that agent's token;
+- an agent's token is accepted **only** from its own workload.
+
+Assertion A23 runs the attack from inside the agent's own pod — the only place
+it exists — and expects `actor_not_bound`.
+
+## 7. Step-up: the one an agent can never pass
 
 `devices_unlock` is marked `stepUp: true`. The gate refuses:
 
@@ -148,7 +209,7 @@ nothing a grant could say that would change the answer.
 
 ---
 
-## 6. What the audit record now says
+## 8. What the audit record now says
 
 ```
 ENFORCER               RESOURCE                    PRINCIPAL  ACTOR      REASON
@@ -166,7 +227,7 @@ what "agent identity" means in practice.
 
 ---
 
-## 7. What this does not solve
+## 9. What this does not solve
 
 Stated plainly, because a demonstration that oversells is worse than one that is narrow.
 
@@ -176,20 +237,23 @@ Stated plainly, because a demonstration that oversells is worse than one that is
 | **Cross-domain delegation** | Everything here is one realm and one mesh. [ID-JAG](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-identity-assertion-authz-grant) is the mechanism for crossing trust domains and is not implemented |
 | **Intent** | The delegation binds *capabilities*, not purpose. "Read my profile" is enforced; "read my profile in order to book a table" is not. CSA's *Mean Time to Understand* is about this gap and the MVP does not close it |
 | **Prompt injection** | Out of scope by construction rather than by defence: the agent is never trusted to report its own authority, so a hijacked agent can only do what was already delegated. That bounds the blast radius; it does not prevent the hijack |
-| **Agent provenance** | `gerege/agent:assistant` is a name in a config file. No attestation, no verifiable credential, nothing proving the running code is the agent it claims to be |
+| **Agent provenance** | The agent now has an owner, a workload binding and an enrolment. What is still absent is attestation: nothing proves the running code is the agent its operator believes they registered |
 
-The last one is the largest. Everything above assumes the workload identity is honest,
-which the mesh does guarantee for *which pod* is calling — but "this pod is agent-runner"
-and "this agent is behaving as its author intended" are different claims, and only the
-first is proven.
+The last one is the largest, and the workload binding narrows it rather than
+closing it. The mesh genuinely proves *which pod* is calling, and that pod may
+now act only as its registered agent. But "this pod is agent-runner" and "this
+agent is behaving as its author intended" remain different claims, and only the
+first is proven. Onboarding and its remaining gaps are in
+[lifecycle.md](lifecycle.md).
 
 ---
 
-## 8. Trying it
+## 10. Trying it
 
 ```bash
 make demo S=6          # the walkthrough
-make verify            # assertions A14-A20
+make verify            # assertions A14-A23
+make inventory         # who answers for every non-human identity
 ```
 
 In a browser: sign in at `http://smarthome.local.test`, open **Ask the Assistant**, then

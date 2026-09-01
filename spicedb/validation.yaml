@@ -30,8 +30,12 @@ relationships: |-
   gerege/device:sensor-1#home@gerege/home:alice-home
   gerege/device:sensor-1#self@gerege/system_principal:sensor-1
 
-  // --- the agent and what alice delegated to it (test fixture only) -------
-  gerege/agent:assistant#controller@gerege/user:alice
+  // --- ownership: every non-human identity answers to a person ------------
+  gerege/system_principal:sensor-1#operator@gerege/user:alice
+  gerege/agent:assistant#operator@gerege/user:alice
+  gerege/agent:assistant#enrolled_for@gerege/user:alice
+
+  // --- what alice delegated to the agent (test fixture only) --------------
 
   gerege/delegation:alice|assistant#delegator@gerege/user:alice
   gerege/delegation:alice|assistant#delegate@gerege/agent:assistant
@@ -79,8 +83,12 @@ assertions:
     - "gerege/consent_grant:alice|smarthome-app#includes@gerege/capability:devices_control"
     - "gerege/consent_grant:alice|smarthome-app#revoke@gerege/user:alice"
 
+    # --- accountability ------------------------------------------------------
+    - "gerege/system_principal:sensor-1#administrate@gerege/user:alice"
+    - "gerege/agent:assistant#administrate@gerege/user:alice"
+    - "gerege/agent:assistant#act_for@gerege/user:alice"
+
     # --- the agent -----------------------------------------------------------
-    - "gerege/agent:assistant#act@gerege/user:alice"
     - "gerege/delegation:alice|assistant#includes@gerege/capability:profile_read"
     - "gerege/delegation:alice|assistant#includes@gerege/capability:devices_control"
     - "gerege/delegation:alice|assistant#revoke@gerege/user:alice"
@@ -126,7 +134,17 @@ assertions:
     # a delegation is one user's, to one agent
     - "gerege/delegation:bob|assistant#includes@gerege/capability:profile_read"
     - "gerege/delegation:alice|assistant#revoke@gerege/user:bob"
-    - "gerege/agent:assistant#act@gerege/user:bob"
+
+    # --- an agent may only act for the users it was enrolled for -------------
+    # Bob is not enrolled. Handing this agent Bob's token must not make it his
+    # agent, and a delegation alone would not have caught that: a delegation
+    # names a user and an agent, but says nothing about whether that pairing
+    # was ever intended.
+    - "gerege/agent:assistant#act_for@gerege/user:bob"
+
+    # --- only the operator administers ---------------------------------------
+    - "gerege/agent:assistant#administrate@gerege/user:bob"
+    - "gerege/system_principal:sensor-1#administrate@gerege/user:bob"
 
     # --- a device identity is not a skeleton key -----------------------------
     - "gerege/device:thermostat-1#push_telemetry@gerege/system_principal:sensor-1"

@@ -102,20 +102,22 @@ def alabel(x, y, s, color, anchor="middle", size=10.5):
 # ================================================================== header ===
 e(f'<rect width="{W}" height="{H}" fill="{BG}"/>')
 text(60, 46, "Gerege IdP — MVP system architecture", 25, INK, "bold")
-text(60, 72,
-     "Every request into an application passes an Envoy sidecar that consults one Go authorizer, which answers from SpiceDB. "
-     "Keycloak only says who you are — and an agent holding your token is bound by what you delegated, not by what you can do.",
+text(60, 70,
+     "Every request into an application passes an Envoy sidecar that consults one Go authorizer, which answers from SpiceDB. Keycloak only says who you are.",
+     13.5, MUTED)
+text(60, 89,
+     "An agent holding your token is bound by what you delegated — and nothing non-human acts without a named human owner.",
      13.5, MUTED)
 
 # =========================================================== top-row panels ==
 # --- three identities -------------------------------------------------------
-PX, PY, PW, PH = 60, 104, 392, 144
+PX, PY, PW, PH = 60, 112, 392, 144
 box(PX, PY, PW, PH, "#fbfcfd", LINE, r=12)
 text(PX + 16, PY + 25, "THE IDENTITIES ON A REQUEST", 10.5, MUTED, "bold", ls="0.9")
 rows = [("Principal", "token sub", "who is accountable"),
         ("Application", "token azp", "who the user consented to"),
-        ("Agent", "azp after RFC 8693", "what is acting, under delegation"),
-        ("Workload", "source.principal", "which process is calling")]
+        ("Agent", "azp after RFC 8693", "what is acting, for whom, under what"),
+        ("Workload", "source.principal", "which process — and it binds the agent")]
 ry = PY + 44
 for name, src, ans in rows:
     text(PX + 16, ry + 10, name, 11.5, INK, "bold")
@@ -124,16 +126,16 @@ for name, src, ans in rows:
     ry += 22
 
 # --- browser ----------------------------------------------------------------
-card(478, 104, 330, 144, "Browser  ·  Alice", "opaque session cookie — never a token",
+card(478, 112, 330, 144, "Browser  ·  Alice", "opaque session cookie — never a token",
      ["profile.local.test", "smarthome.local.test", "account.local.test"], mono_lines=True)
 
 # --- terminal ---------------------------------------------------------------
-card(830, 104, 330, 144, "Terminal", "the same system, scripted",
-     ["make verify   29 assertions", "make demo     6 scenarios", "curl + Bearer token"],
+card(830, 112, 330, 144, "Terminal", "the same system, scripted",
+     ["make verify   35 assertions", "make demo     6 scenarios", "make inventory  who owns what"],
      mono_lines=True)
 
 # --- legend -----------------------------------------------------------------
-LX, LY, LW, LH = 1194, 104, 454, 144
+LX, LY, LW, LH = 1194, 112, 454, 144
 box(LX, LY, LW, LH, "#fbfcfd", LINE, r=12)
 text(LX + 16, LY + 25, "EDGES", 10.5, MUTED, "bold", ls="0.9")
 leg = [(REQ,   "solid", "request path"),
@@ -171,10 +173,10 @@ card(406, 320, 568, 146, "istio-ingressgateway", "NodePort 30080  ←  host :80"
       "PeerAuthentication STRICT downstream: mTLS to every sidecar"], title_size=14)
 
 nsbox(1080, 288, 568, 196, "dev", "ns devices", "no injection · outside the mesh")
-card(1102, 320, 524, 146, "telemetry-simulator", "an IoT device, holding only a token",
+card(1102, 320, 524, 146, "telemetry-simulator", "an IoT device  ·  operator: alice",
      ["client_credentials → sensor-1   (no user, no consent)",
       "every 20s:  1 request permitted,  3 refused",
-      "own telemetry ✓   ·   thermostat-1 ✗   ·   alice's profile ✗   ·   no token ✗"], title_size=14)
+      "onboarded and decommissioned by one command — make onboard-device"], title_size=14)
 
 # ------------------------------------------------------------------ ns apps --
 nsbox(84, 508, 908, 712, "apps", "ns apps",
@@ -187,8 +189,8 @@ apps = [
      "no authorization logic in this service. look for it: there is none", None),
     (778, "smarthome-service", "sa/smarthome-service  ·  browser UI + API, third-party",
      "consent enforced — the azp claim is the only thing that differs", None),
-    (891, "agent-runner",      "sa/agent-runner  ·  the agent",
-     "RFC 8693 exchange: sub stays alice, azp becomes the agent — then it acts, bound by the delegation", AGENT),
+    (891, "agent-runner",      "sa/agent-runner  ·  the agent  ·  operator: alice",
+     "RFC 8693 exchange, and bound to it: this workload may present only the assistant's token", AGENT),
     (1004, "device-service",   "sa/device-service  ·  device state + /telemetry ingest",
      "/internal/* callable only by smarthome-service and agent-runner; /telemetry only by the device", None),
 ]
@@ -214,10 +216,10 @@ steps = [
     ("1", "OIDC callback and logout — before any authorization"),
     ("2", "principal   ←  bearer token, or session → token"),
     ("3", "application ← azp   ·   workload ← source.principal"),
-    ("4", "match a route rule   —   no match → DENY"),
-    ("5", "is this workload registered for this application?"),
+    ("4", "workload bound to the actor it presents?   —   else DENY"),
+    ("5", "workload registered for this route?"),
     ("6", "step-up gate  —  agents cannot pass"),
-    ("7", "CheckBulkPermissions [ permission, consent | delegation ]"),
+    ("7", "CheckBulk [ permission, consent | enrolment + delegation ]"),
     ("8", "emit a decision record  —  principal AND actor"),
 ]
 sy = EA_Y + 78
@@ -232,12 +234,12 @@ text(EA_X + 20, sy + 16, "read-only on SpiceDB   ·   no decision cache   ·   e
 text(EA_X + 20, sy + 33, "22 rules · defaultAction DENY · health :9002 · decision log :9003 (pod-only)",
      10.5, FAINT, family=MONO)
 
-card(1180, 900, 292, 106, "account-app", "sa/account-app · consent + delegation",
-     ["the ONLY component that writes", "consent or delegations"], title_size=14)
+card(1180, 900, 292, 106, "account-app", "sa/account-app · consent · delegation · ownership",
+     ["the ONLY writer. decommission is", "gated on `administrate`"], title_size=14)
 card(1102, 1022, 248, 96, "Keycloak 26.7.2", "login · SSO · RFC 8693 exchange",
      ["authentication only —", "holds no authorization state"], title_size=14)
 card(1372, 1022, 254, 96, "SpiceDB 1.56.0", "Zanzibar relationships",
-     ["permission · consent ·", "delegation (with expiry)"], title_size=14)
+     ["permission · consent · delegation", "ownership · enrolment"], title_size=14)
 card(1102, 1130, 248, 68, "PostgreSQL 18.6", "keycloak", title_size=12.5)
 card(1372, 1130, 254, 68, "PostgreSQL 18.6", "spicedb · track_commit_timestamp=on", title_size=12.5)
 
@@ -248,10 +250,10 @@ APP_R = APP_X + APP_W          # 952
 ID_L = 1102                    # ext-authz / keycloak left edge
 
 # --- browser and terminal into the gateway ----------------------------------
-path([(620, 248), (620, 320)], REQ, 2.2)
-alabel(620, 288, "http  :80", REQ)
-path([(944, 248), (944, 320)], REQ, 2.2)
-alabel(944, 288, "Bearer", REQ)
+path([(620, 256), (620, 320)], REQ, 2.2)
+alabel(620, 292, "http  :80", REQ)
+path([(944, 256), (944, 320)], REQ, 2.2)
+alabel(944, 292, "Bearer", REQ)
 
 # --- the device into the gateway --------------------------------------------
 path([(1102, 380), (974, 380)], REQ, 2.2)
@@ -320,8 +322,8 @@ text(60, 1264,
      "every error branch in ext-authz returns a denial  ·  SpiceDB unreachable → nothing is permitted.",
      11.5, MUTED)
 text(60, 1282,
-     "An agent adds one actor, one grant and one gate:  it is registered rather than inferred  ·  its authority is an expiring delegation, not the token it holds  ·  "
-     "and a step-up route refuses it outright, because it cannot re-authenticate the person behind it.",
+     "Accountability is a relationship:  every agent and every device has a named operator who answers for it and is the only one who may switch it off  ·  "
+     "an agent acts only for users it is enrolled for, only what they delegated, only while that lasts.",
      11.5, AGENT)
 
 # ---------------------------------------------------------------- assemble ---

@@ -7,6 +7,7 @@ package logx
 
 import (
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -54,6 +55,8 @@ const (
 	ReasonPermissionDenied      = "permission_denied"
 	ReasonConsentRequired       = "consent_required"
 	ReasonDelegationRequired    = "delegation_required"
+	ReasonAgentNotEnrolled      = "agent_not_enrolled"
+	ReasonActorNotBound         = "actor_not_bound"
 	ReasonStepUpRequired        = "step_up_required"
 	ReasonConditionalResult     = "conditional_result"
 	ReasonBackendUnavailable    = "backend_unavailable"
@@ -69,6 +72,13 @@ var (
 )
 
 const ringSize = 256
+
+// Quiet silences the writer while keeping the ring buffer, for tests that
+// assert on decisions rather than read them. The ring buffer is what
+// TestAgentIsDistinguishableInTheAuditRecord inspects, so it must survive.
+func Quiet() {
+	logger = slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
 
 // Log writes the decision to stdout and records it in the ring buffer.
 func Log(d Decision) {

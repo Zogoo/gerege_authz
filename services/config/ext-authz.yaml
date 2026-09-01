@@ -95,6 +95,14 @@ agents:
   - name: assistant-agent
     object: assistant
     displayName: Assistant
+    # Binds the actor to the process. mTLS proves which workload is calling and
+    # cannot be forged; the token only *claims* what it is acting as. Checking
+    # them independently let this process decline to exchange its token and act
+    # as the application whose token it was handed — bypassing delegation and
+    # step-up entirely. With the binding, agent-runner may present only the
+    # assistant's token, and the assistant's token is accepted only from
+    # agent-runner.
+    workload: spiffe://cluster.local/ns/apps/sa/agent-runner
 
 rules:
   # =========================================================================
@@ -346,10 +354,18 @@ rules:
   # the caller is not in the mesh at all — its identity is the token it holds
   # and the relationship graph behind it.
   #
-  # This is also the only rule that uses at_least_as_fresh rather than
-  # fully_consistent. Telemetry is high-frequency and no assertion depends on
-  # observing a revocation here, so it is the right place to exercise the
-  # ZedToken path (mvp_docs/03 §6).
+  # fully_consistent, like everything else — and this rule is why.
+  #
+  # It was at_least_as_fresh, on the reasoning that telemetry is high-frequency
+  # and no assertion depended on observing a revocation here. That was wrong:
+  # this is the one route a *device* uses, so it is exactly the route where
+  # decommissioning has to bite immediately. Reading at a slightly stale
+  # revision let a token survive its own device being decommissioned, which is
+  # the single property the whole offboarding design exists to provide
+  # (assertion A25 caught it).
+  #
+  # The at_least_as_fresh implementation and its ZedToken tracking remain in
+  # internal/spicedb — the seam is kept, nothing currently uses it.
   - id: telemetry-ingest
     methods: [POST]
     path: /telemetry/{deviceId}
@@ -358,7 +374,7 @@ rules:
     permission: push_telemetry
     consentRequired: false
     authMode: bearer
-    consistency: at_least_as_fresh
+    consistency: fully_consistent
 
   # =========================================================================
   # agent-runner — the agent

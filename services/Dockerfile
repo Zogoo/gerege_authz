@@ -24,8 +24,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 # The route configuration is validated at image build time. A configuration
 # that would stop ext-authz starting fails the build instead (M-006 in CI form).
-COPY config/ext-authz.yaml /tmp/ext-authz.yaml
-RUN /out/configcheck /tmp/ext-authz.yaml > /dev/null
+COPY config/ext-authz.yaml config/catalogue.yaml /tmp/
+RUN /out/configcheck /tmp/ext-authz.yaml /tmp/catalogue.yaml > /dev/null
 
 FROM alpine:3.23
 RUN apk add --no-cache ca-certificates tzdata curl \

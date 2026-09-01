@@ -1,0 +1,53 @@
+# The human-facing catalogue: what a capability means, which applications and
+# agents may ask for what, and how long a delegation may last.
+#
+# This was compiled into the account console. It is data because onboarding an
+# agent should not require rebuilding a binary — and because the wording a
+# person reads before granting access is policy, not code.
+#
+# `sensitive` is the single source of truth for step-up. A capability marked
+# sensitive must be guarded by a route with `stepUp: true`, and a stepUp route
+# must name a sensitive capability; `configcheck` fails if the two drift apart.
+# Sensitive capabilities are never offered for delegation to an agent: a route
+# that requires a person to authenticate cannot be walked by something that
+# cannot authenticate a person.
+
+capabilities:
+  - id: profile_read
+    display: See your name, email, phone and address
+  - id: profile_write
+    display: Update your address and phone number
+  - id: devices_view
+    display: See the devices in your home and their state
+  - id: devices_control
+    display: Turn your devices on and off
+  - id: devices_unlock
+    display: Lock and unlock your doors
+    sensitive: true
+
+applications:
+  - name: smarthome-app
+    display: Smart Home
+    requests: [profile_read, devices_view, devices_control, devices_unlock]
+  - name: profile-app
+    display: Profile App
+  - name: account-app
+    display: Account Console
+
+agents:
+  - name: assistant
+    display: Assistant
+    # It may ask for anything the product offers. What it can actually be
+    # delegated is this list minus the sensitive ones, computed rather than
+    # maintained by hand so the two cannot disagree.
+    requests: [profile_read, devices_view, devices_control, devices_unlock]
+
+# There is no "forever". A delegation that does not expire is a standing
+# privilege, which is the failure mode the mechanism exists to prevent.
+delegationTTLs:
+  - label: 5 minutes
+    value: 5m
+  - label: 1 hour
+    value: 1h
+  - label: 8 hours
+    value: 8h

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -82,22 +83,56 @@ type Response struct {
 	ConsentChallenge string
 }
 
+// Snapshot is a validated configuration and the route table compiled from it.
+// The two always travel together: a table compiled from one config and used
+// with another would authorize against rules nobody wrote.
+type Snapshot struct {
+	cfg   *config.Config
+	table *routes.Table
+}
+
+// NewSnapshot compiles a configuration into a servable snapshot.
+func NewSnapshot(cfg *config.Config) (*Snapshot, error) {
+	table, err := routes.Compile(cfg.Rules)
+	if err != nil {
+		return nil, err
+	}
+	return &Snapshot{cfg: cfg, table: table}, nil
+}
+
+// Rules reports how many rules the snapshot serves, for logging.
+func (s *Snapshot) Rules() int { return len(s.cfg.Rules) }
+
 // Pipeline is the decision point. It is read-only with respect to SpiceDB.
 type Pipeline struct {
-	cfg      *config.Config
-	table    *routes.Table
+	// snapshot is swapped atomically so that onboarding a device or an agent —
+	// which adds an entry to a registry — does not require restarting the one
+	// component every request depends on. A request reads the snapshot once and
+	// is decided entirely against it; a reload never applies to a request
+	// already in flight.
+	snapshot atomic.Pointer[Snapshot]
+
 	oidc     *oidcauth.Provider
 	sessions session.Store
 	perms    spicedb.Checker
 	// consentBase is the account console's external base URL, used to build
-	// the consent challenge.
+	// the consent and delegation challenges.
 	consentBase string
 }
 
 // New wires the pipeline.
-func New(cfg *config.Config, table *routes.Table, op *oidcauth.Provider, st session.Store, pc spicedb.Checker, consentBase string) *Pipeline {
-	return &Pipeline{cfg: cfg, table: table, oidc: op, sessions: st, perms: pc, consentBase: consentBase}
+func New(snap *Snapshot, op *oidcauth.Provider, st session.Store, pc spicedb.Checker, consentBase string) *Pipeline {
+	p := &Pipeline{oidc: op, sessions: st, perms: pc, consentBase: consentBase}
+	p.snapshot.Store(snap)
+	return p
 }
+
+// Swap installs a new configuration for subsequent requests.
+//
+// Callers must only ever pass a snapshot that compiled cleanly. A configuration
+// that fails to load leaves the previous one serving — a bad edit must not be
+// able to take the authorizer down, and it must not be able to open it either.
+func (p *Pipeline) Swap(snap *Snapshot) { p.snapshot.Store(snap) }
 
 const (
 	callbackPath = "/_id/callback"
@@ -129,21 +164,24 @@ func (p *Pipeline) Check(ctx context.Context, req Request) Response {
 }
 
 func (p *Pipeline) check(ctx context.Context, req Request, d *logx.Decision) Response {
+	snap := p.snapshot.Load()
+	cfg, table := snap.cfg, snap.table
+
 	// ---- step 1: special paths -------------------------------------------
 	// OIDC mechanics must not be subject to the authorization they establish
 	// (mvp_docs/07 §5, item 3).
 	switch pathOnly(req.Path) {
 	case callbackPath:
-		return p.handleCallback(ctx, req, d)
+		return p.handleCallback(ctx, cfg, req, d)
 	case logoutPath:
-		return p.handleLogout(ctx, req, d)
+		return p.handleLogout(ctx, cfg, req, d)
 	}
 
 	// ---- step 4 (early, for public routes) --------------------------------
 	// Public routes are still rules. Matching them before authentication is
 	// what lets an unauthenticated landing page and static assets exist
 	// without an implicit allow anywhere in the system.
-	rule, params, matched := p.table.Match(req.Host, req.Method, req.Path)
+	rule, params, matched := table.Match(req.Host, req.Method, req.Path)
 	if matched {
 		d.Rule = rule.ID
 	}
@@ -152,7 +190,7 @@ func (p *Pipeline) check(ctx context.Context, req Request, d *logx.Decision) Res
 	}
 
 	// ---- steps 2 and 3: principal, application, workload ------------------
-	id, resp := p.identify(ctx, req, rule, matched, d)
+	id, resp := p.identify(ctx, cfg, req, rule, matched, d)
 	if resp != nil {
 		return *resp
 	}
@@ -160,6 +198,16 @@ func (p *Pipeline) check(ctx context.Context, req Request, d *logx.Decision) Res
 	d.Kind = id.kind
 	d.Actor = id.agent
 	d.Application = id.application
+
+	// ---- the workload must be bound to the actor it presents ---------------
+	// mTLS proves which process is calling; the token only claims what it is
+	// acting as. Checking them independently let a process registered to run an
+	// agent decline to exchange its token and act as the application instead,
+	// skipping delegation and step-up. Binding them closes that generally,
+	// rather than route by route.
+	if resp := checkActorBinding(cfg, req.SourcePrincipal, id); resp != nil {
+		return *resp
+	}
 
 	// ---- step 4: no matching rule denies (M-006) --------------------------
 	if !matched {
@@ -204,47 +252,81 @@ func (p *Pipeline) check(ctx context.Context, req Request, d *logx.Decision) Res
 	d.Resource = rule.ResourceType + ":" + resourceID
 	d.Permission = rule.Permission
 
-	queries := []spicedb.Query{{
-		ResourceType: rule.ResourceType,
-		ResourceID:   resourceID,
-		Permission:   rule.Permission,
-		SubjectType:  id.subjectType,
-		SubjectID:    id.subject,
+	// The questions are built as a list of named checks rather than positional
+	// slots. There are up to four of them now, and indexing outcomes by hand is
+	// exactly the sort of bookkeeping that silently reads the wrong answer.
+	plan := []check{{
+		kind:   checkPermission,
+		reason: logx.ReasonPermissionDenied,
+		detail: fmt.Sprintf("%s:%s#%s is not granted", rule.ResourceType, resourceID, rule.Permission),
+		query: spicedb.Query{
+			ResourceType: rule.ResourceType,
+			ResourceID:   resourceID,
+			Permission:   rule.Permission,
+			SubjectType:  id.subjectType,
+			SubjectID:    id.subject,
+		},
 	}}
 
-	consentNeeded := p.consentApplies(rule, id)
-	if consentNeeded {
+	if consentApplies(cfg, rule, id) {
 		d.Capability = rule.Capability
 		d.ConsentSeen = true
-		queries = append(queries, spicedb.Query{
-			ResourceType: "gerege/consent_grant",
-			ResourceID:   consentGrantID(id.subject, id.application),
-			Permission:   "includes",
-			SubjectType:  "gerege/capability",
-			SubjectID:    rule.Capability,
+		plan = append(plan, check{
+			kind:   checkConsent,
+			reason: logx.ReasonConsentRequired,
+			detail: fmt.Sprintf("%s has not been granted %s", id.application, rule.Capability),
+			query: spicedb.Query{
+				ResourceType: "gerege/consent_grant",
+				ResourceID:   consentGrantID(id.subject, id.application),
+				Permission:   "includes",
+				SubjectType:  "gerege/capability",
+				SubjectID:    rule.Capability,
+			},
 		})
 	}
 
-	// An agent's token carries the human's `sub`, so the permission check above
-	// has already passed on the human's own authority. The delegation check is
-	// what stops the agent inheriting it: a separate, expiring grant naming
-	// this agent and this capability, which the human made deliberately and can
-	// withdraw without touching either their own permissions or their consent.
-	//
-	// The capability is required for an agent even where consent is not — a
-	// first-party application is trusted with the user's data; an agent acting
-	// inside it still is not.
-	delegationNeeded := id.kind == kindAgent && rule.Capability != ""
-	if delegationNeeded {
-		d.Capability = rule.Capability
-		d.Delegated = true
-		queries = append(queries, spicedb.Query{
-			ResourceType: "gerege/delegation",
-			ResourceID:   DelegationID(id.subject, id.agent),
-			Permission:   "includes",
-			SubjectType:  "gerege/capability",
-			SubjectID:    rule.Capability,
+	if id.kind == kindAgent {
+		// Enrolment: may this agent act for this user at all? Durable, and
+		// distinct from the delegation, which says what it may do for them. A
+		// delegation names a user and an agent but says nothing about whether
+		// that pairing was ever intended — so an agent handed somebody else's
+		// token would otherwise only be caught if that person happened to have
+		// no delegation.
+		plan = append(plan, check{
+			kind:   checkEnrolment,
+			reason: logx.ReasonAgentNotEnrolled,
+			detail: fmt.Sprintf("%s is not enrolled to act for %s", id.agent, id.subject),
+			query: spicedb.Query{
+				ResourceType: "gerege/agent",
+				ResourceID:   id.agent,
+				Permission:   "act_for",
+				SubjectType:  "gerege/user",
+				SubjectID:    id.subject,
+			},
 		})
+
+		if rule.Capability != "" {
+			d.Capability = rule.Capability
+			d.Delegated = true
+			plan = append(plan, check{
+				kind:   checkDelegation,
+				reason: logx.ReasonDelegationRequired,
+				detail: fmt.Sprintf("%s was not delegated %s by %s, or the delegation has expired",
+					id.agent, rule.Capability, id.subject),
+				query: spicedb.Query{
+					ResourceType: "gerege/delegation",
+					ResourceID:   DelegationID(id.subject, id.agent),
+					Permission:   "includes",
+					SubjectType:  "gerege/capability",
+					SubjectID:    rule.Capability,
+				},
+			})
+		}
+	}
+
+	queries := make([]spicedb.Query, len(plan))
+	for i, c := range plan {
+		queries[i] = c.query
 	}
 
 	outcomes, err := p.perms.CheckBulk(ctx, d.DecisionID, rule.Consistency == config.ConsistencyFull, queries...)
@@ -256,38 +338,26 @@ func (p *Pipeline) check(ctx context.Context, req Request, d *logx.Decision) Res
 			Body: denyBody(logx.ReasonBackendUnavailable, "the authorization backend could not be reached")}
 	}
 
-	if r := classify(outcomes[0], logx.ReasonPermissionDenied,
-		fmt.Sprintf("%s:%s#%s is not granted", rule.ResourceType, resourceID, rule.Permission)); r != nil {
-		return *r
-	}
-	next := 1
-	if consentNeeded {
-		if r := classify(outcomes[next], logx.ReasonConsentRequired,
-			fmt.Sprintf("%s has not been granted %s", id.application, rule.Capability)); r != nil {
+	for i, c := range plan {
+		r := classify(outcomes[i], c.reason, c.detail)
+		if r == nil {
+			continue
+		}
+		switch c.kind {
+		case checkConsent:
 			r.ConsentChallenge = p.challenge(id.application, rule.Capability, req)
-			r.Headers = map[string]string{
-				"www-authenticate": fmt.Sprintf(
-					`Consent realm="gerege", application=%q, capability=%q, consent_uri=%q`,
-					id.application, rule.Capability, r.ConsentChallenge),
-			}
+			r.Headers = map[string]string{"www-authenticate": fmt.Sprintf(
+				`Consent realm="gerege", application=%q, capability=%q, consent_uri=%q`,
+				id.application, rule.Capability, r.ConsentChallenge)}
 			r.Body = consentBody(id.application, rule.Capability, r.ConsentChallenge)
-			return *r
-		}
-		next++
-	}
-	if delegationNeeded {
-		if r := classify(outcomes[next], logx.ReasonDelegationRequired,
-			fmt.Sprintf("%s was not delegated %s by %s, or the delegation has expired",
-				id.agent, rule.Capability, id.subject)); r != nil {
+		case checkDelegation:
 			r.ConsentChallenge = p.delegationChallenge(id.agent, rule.Capability, req)
-			r.Headers = map[string]string{
-				"www-authenticate": fmt.Sprintf(
-					`Delegation realm="gerege", agent=%q, capability=%q, delegate_uri=%q`,
-					id.agent, rule.Capability, r.ConsentChallenge),
-			}
+			r.Headers = map[string]string{"www-authenticate": fmt.Sprintf(
+				`Delegation realm="gerege", agent=%q, capability=%q, delegate_uri=%q`,
+				id.agent, rule.Capability, r.ConsentChallenge)}
 			r.Body = delegationBody(id.agent, rule.Capability, r.ConsentChallenge)
-			return *r
 		}
+		return *r
 	}
 
 	// ---- permit ------------------------------------------------------------
@@ -309,6 +379,56 @@ func upstreamHeaders(id identity) map[string]string {
 		h["authorization"] = "Bearer " + id.accessToken
 	}
 	return h
+}
+
+// check is one question put to SpiceDB, with what to say if the answer is no.
+type check struct {
+	kind   checkKind
+	query  spicedb.Query
+	reason string
+	detail string
+}
+
+type checkKind int
+
+const (
+	checkPermission checkKind = iota
+	checkConsent
+	checkEnrolment
+	checkDelegation
+)
+
+// checkActorBinding enforces the pairing of workload and actor in both
+// directions: a workload registered to run an agent may present only that
+// agent's token, and an agent's token is accepted only from its own workload.
+//
+// The asymmetry it fixes is worth stating. mTLS proves the workload and cannot
+// be forged by a compromised peer. The token merely claims the actor. Checking
+// them separately means the strong identity never constrains the weak one — so
+// the process holding a user's token could simply choose not to exchange it.
+func checkActorBinding(cfg *config.Config, sourcePrincipal string, id identity) *Response {
+	bound, isAgentWorkload := cfg.AgentByWorkload(sourcePrincipal)
+
+	if isAgentWorkload && (id.kind != kindAgent || id.agent != bound.Object) {
+		logx.Error("agent workload presented a token that is not its agent's",
+			"workload", sourcePrincipal, "expected_agent", bound.Object,
+			"presented_kind", id.kind, "presented_actor", id.agent,
+			"presented_azp", id.application)
+		return &Response{Outcome: Deny, Status: 403, Reason: logx.ReasonActorNotBound,
+			Body: denyBody(logx.ReasonActorNotBound,
+				"this workload may act only as its registered agent; forwarding the user's own token is not permitted")}
+	}
+
+	if id.kind == kindAgent && !isAgentWorkload {
+		if ag, ok := cfg.AgentByClient(id.application); ok && ag.Workload != "" {
+			logx.Error("agent token presented from a workload it is not bound to",
+				"agent", id.agent, "bound_to", ag.Workload, "source_principal", sourcePrincipal)
+			return &Response{Outcome: Deny, Status: 403, Reason: logx.ReasonActorNotBound,
+				Body: denyBody(logx.ReasonActorNotBound,
+					"this agent's token is only accepted from the workload it is bound to")}
+		}
+	}
+	return nil
 }
 
 func classify(o spicedb.Outcome, denyReason, detail string) *Response {
@@ -352,14 +472,14 @@ func checkWorkload(rule *config.Rule, source string) *Response {
 //	sensor-1 pushing its own telemetry         → no   (no user in the loop)
 //	internal hop carrying azp=smarthome-app    → yes  (the hop does not change
 //	                                                   the application)
-func (p *Pipeline) consentApplies(rule *config.Rule, id identity) bool {
+func consentApplies(cfg *config.Config, rule *config.Rule, id identity) bool {
 	if !rule.ConsentRequired {
 		return false
 	}
 	if id.kind != kindUser {
 		return false
 	}
-	if app, ok := p.cfg.AppByName(id.application); ok && app.FirstParty {
+	if app, ok := cfg.AppByName(id.application); ok && app.FirstParty {
 		return false
 	}
 	return true

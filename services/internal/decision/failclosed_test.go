@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"github.com/gerege/idp-mvp/internal/config"
 	"github.com/gerege/idp-mvp/internal/logx"
 	"github.com/gerege/idp-mvp/internal/oidcauth"
-	"github.com/gerege/idp-mvp/internal/routes"
 	"github.com/gerege/idp-mvp/internal/session"
 	"github.com/gerege/idp-mvp/internal/spicedb"
 )
@@ -29,6 +29,13 @@ import (
 //
 // The table walks every branch that can go wrong and asserts the same thing
 // each time: the outcome is not Permit.
+func TestMain(m *testing.M) {
+	// The decision log is verbose by design. Tests assert on the ring buffer,
+	// not on stdout, so silence the writer and keep the buffer.
+	logx.Quiet()
+	os.Exit(m.Run())
+}
+
 func TestFailsClosed(t *testing.T) {
 	env := newEnv(t)
 
@@ -225,11 +232,11 @@ func TestDeviceIdentityIsNotASkeletonKey(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type env struct {
-	cfg   *config.Config
-	table *routes.Table
-	oidc  *oidcauth.Provider
-	key   *rsa.PrivateKey
-	iss   string
+	cfg  *config.Config
+	snap *Snapshot
+	oidc *oidcauth.Provider
+	key  *rsa.PrivateKey
+	iss  string
 }
 
 func newEnv(t *testing.T) *env {
@@ -258,7 +265,11 @@ func newEnv(t *testing.T) *env {
 			{Name: "smarthome-app", ClientSecret: "s", Hosts: []string{"smarthome.local.test"}},
 		},
 		SystemPrincipals: map[string]string{"sensor-1": "sensor-1"},
-		Agents:           []config.Agent{{Name: "assistant-agent", Object: "assistant"}},
+		Agents: []config.Agent{{
+			Name:     "assistant-agent",
+			Object:   "assistant",
+			Workload: "spiffe://cluster.local/ns/apps/sa/agent-runner",
+		}},
 		Rules: []config.Rule{
 			{
 				ID: "profile-read", Methods: []string{"GET"}, Path: "/api/profile/{userId}",
@@ -272,7 +283,10 @@ func newEnv(t *testing.T) *env {
 				Capability: "devices_unlock", ConsentRequired: true,
 				StepUp: true, StepUpMinACR: 1,
 				AuthMode: config.AuthModeBearer, Consistency: config.ConsistencyFull,
-				Callers: []string{"spiffe://cluster.local/ns/apps/sa/smarthome-service"},
+				Callers: []string{
+					"spiffe://cluster.local/ns/apps/sa/smarthome-service",
+					"spiffe://cluster.local/ns/apps/sa/agent-runner",
+				},
 			},
 			{
 				ID: "device-state", Methods: []string{"POST"}, Path: "/internal/devices/{deviceId}/state",
@@ -288,15 +302,15 @@ func newEnv(t *testing.T) *env {
 			},
 		},
 	}
-	table, err := routes.Compile(cfg.Rules)
+	snap, err := NewSnapshot(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &env{cfg: cfg, table: table, oidc: oidcauth.New(cfg.Issuer, ts.Client()), key: key, iss: external}
+	return &env{cfg: cfg, snap: snap, oidc: oidcauth.New(cfg.Issuer, ts.Client()), key: key, iss: external}
 }
 
 func (e *env) pipeline(c spicedb.Checker) *Pipeline {
-	return New(e.cfg, e.table, e.oidc, session.NewMemoryStore(), c, "http://account.local.test")
+	return New(e.snap, e.oidc, session.NewMemoryStore(), c, "http://account.local.test")
 }
 
 func (e *env) token(t *testing.T, sub, azp string) string {
@@ -358,6 +372,12 @@ func (e *env) cookieReq(method, path, sid string) Request {
 		Method: method, Path: path, Host: "profile-service.apps.svc.cluster.local", Scheme: "http",
 		Headers: map[string]string{"cookie": "gerege_session=" + sid},
 	}
+}
+
+// agentReq is a request arriving from the workload the agent is bound to.
+func (e *env) agentReq(method, path, token string) Request {
+	return e.withSource(e.bearerReq(method, path, token),
+		"spiffe://cluster.local/ns/apps/sa/agent-runner")
 }
 
 func (e *env) withSource(r Request, principal string) Request {
@@ -431,12 +451,12 @@ func (c *countingChecker) Close() error { return nil }
 // request from one Alice made herself. What refuses it is the delegation check.
 func TestAgentDoesNotInheritTheUsersAuthority(t *testing.T) {
 	env := newEnv(t)
-	// permission ✓  delegation ✗
-	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Denied}}
+	// permission ✓  enrolment ✓  delegation ✗
+	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted, spicedb.Denied}}
 	p := env.pipeline(c)
 
 	got := p.Check(context.Background(),
-		env.bearerReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
+		env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
 
 	if got.Outcome == Permit {
 		t.Fatal("an agent inherited the user's authority — the delegation check is not being applied")
@@ -444,10 +464,10 @@ func TestAgentDoesNotInheritTheUsersAuthority(t *testing.T) {
 	if got.Reason != logx.ReasonDelegationRequired {
 		t.Errorf("reason = %q, want %q", got.Reason, logx.ReasonDelegationRequired)
 	}
-	if c.lastCount != 2 {
-		t.Fatalf("sent %d checks, want 2 (permission, delegation)", c.lastCount)
+	if c.lastCount != 3 {
+		t.Fatalf("sent %d checks, want 3 (permission, enrolment, delegation)", c.lastCount)
 	}
-	d := c.lastQueries[1]
+	d := c.lastQueries[2]
 	if d.ResourceType != "gerege/delegation" || d.ResourceID != "alice|assistant" {
 		t.Errorf("delegation check was %s, want gerege/delegation:alice|assistant", d)
 	}
@@ -460,11 +480,11 @@ func TestAgentDoesNotInheritTheUsersAuthority(t *testing.T) {
 // could pass by refusing agents outright, which would be a different system.
 func TestAgentActsWhenDelegated(t *testing.T) {
 	env := newEnv(t)
-	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted}}
+	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted}}
 	p := env.pipeline(c)
 
 	got := p.Check(context.Background(),
-		env.bearerReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
+		env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
 	if got.Outcome != Permit {
 		t.Fatalf("outcome = %v (reason %q), want Permit", got.Outcome, got.Reason)
 	}
@@ -501,23 +521,25 @@ func TestConsentAndDelegationApplyToDifferentActors(t *testing.T) {
 		}
 	})
 
-	t.Run("an agent request asks about delegation, not consent", func(t *testing.T) {
-		c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted}}
+	t.Run("an agent request asks about enrolment and delegation, not consent", func(t *testing.T) {
+		c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted}}
 		p := env.pipeline(c)
 		p.Check(context.Background(),
-			env.bearerReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
-		if c.lastCount != 2 {
-			t.Fatalf("sent %d checks, want 2 (permission, delegation)", c.lastCount)
+			env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
+		if c.lastCount != 3 {
+			t.Fatalf("sent %d checks, want 3 (permission, enrolment, delegation)", c.lastCount)
 		}
-		if got := c.lastQueries[1].ResourceType; got != "gerege/delegation" {
-			t.Errorf("second check was %s, want a delegation", got)
+		for i, want := range []string{"gerege/user_profile", "gerege/agent", "gerege/delegation"} {
+			if got := c.lastQueries[i].ResourceType; got != want {
+				t.Errorf("check %d was %s, want %s", i, got, want)
+			}
 		}
 	})
 
 	t.Run("delegation cannot substitute for the user's own permission", func(t *testing.T) {
-		p := env.pipeline(fixedChecker{spicedb.Denied, spicedb.Permitted})
+		p := env.pipeline(fixedChecker{spicedb.Denied, spicedb.Permitted, spicedb.Permitted})
 		got := p.Check(context.Background(),
-			env.bearerReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
+			env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
 		if got.Reason != logx.ReasonPermissionDenied {
 			t.Errorf("reason = %q, want permission_denied — an agent cannot exceed its principal", got.Reason)
 		}
@@ -532,13 +554,11 @@ func TestConsentAndDelegationApplyToDifferentActors(t *testing.T) {
 // no amount of delegation can produce a human at a keyboard.
 func TestAgentCannotStepUp(t *testing.T) {
 	env := newEnv(t)
-	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted}}
+	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted}}
 	p := env.pipeline(c)
 
 	got := p.Check(context.Background(),
-		env.withSource(
-			env.bearerReq("POST", "/internal/devices/lock-1/unlock", env.agentToken(t, "alice")),
-			"spiffe://cluster.local/ns/apps/sa/smarthome-service"))
+		env.agentReq("POST", "/internal/devices/lock-1/unlock", env.agentToken(t, "alice")))
 
 	if got.Outcome == Permit {
 		t.Fatal("an agent walked through a step-up route")
@@ -583,11 +603,11 @@ func TestHumanStepUpNeedsFreshAuthentication(t *testing.T) {
 // accountable from the actor that ran.
 func TestAgentIsDistinguishableInTheAuditRecord(t *testing.T) {
 	env := newEnv(t)
-	p := env.pipeline(fixedChecker{spicedb.Permitted, spicedb.Permitted})
+	p := env.pipeline(fixedChecker{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted})
 
 	before := len(logx.Recent())
 	p.Check(context.Background(),
-		env.bearerReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
+		env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
 	recs := logx.Recent()
 	if len(recs) <= before {
 		t.Fatal("no decision was recorded")
@@ -604,5 +624,99 @@ func TestAgentIsDistinguishableInTheAuditRecord(t *testing.T) {
 	}
 	if !d.Delegated {
 		t.Error("delegation_checked was false on an agent request")
+	}
+}
+
+// TestAgentMustBeEnrolledForThePrincipal.
+//
+// An agent handed a token belonging to somebody it was never enrolled for is
+// refused before any delegation question is asked. The delegation check alone
+// would not catch this: a delegation names a user and an agent, but nothing in
+// it says that pairing was ever intended — so an agent enrolled for Alice, given
+// Bob's token, would be refused only if Bob happened to have no delegation.
+func TestAgentMustBeEnrolledForThePrincipal(t *testing.T) {
+	env := newEnv(t)
+	// permission ✓  enrolment ✗   (delegation would have said yes)
+	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Denied, spicedb.Permitted}}
+	p := env.pipeline(c)
+
+	got := p.Check(context.Background(),
+		env.agentReq("GET", "/api/profile/bob", env.agentToken(t, "bob")))
+
+	if got.Outcome == Permit {
+		t.Fatal("an agent acted for a principal it was never enrolled for")
+	}
+	if got.Reason != logx.ReasonAgentNotEnrolled {
+		t.Errorf("reason = %q, want %q", got.Reason, logx.ReasonAgentNotEnrolled)
+	}
+	q := c.lastQueries[1]
+	if q.ResourceType != "gerege/agent" || q.ResourceID != "assistant" || q.Permission != "act_for" {
+		t.Errorf("enrolment check was %s, want gerege/agent:assistant#act_for", q)
+	}
+	if q.SubjectID != "bob" {
+		t.Errorf("enrolment was checked for %q, want bob", q.SubjectID)
+	}
+}
+
+// TestAgentWorkloadCannotActAsTheApplication is the hole this binding closes.
+//
+// agent-runner receives Alice's application token in order to exchange it. If it
+// simply forwards that token instead, it stops being an agent as far as the
+// authorizer is concerned: it becomes the application, and gets consent-scoped
+// access with no delegation check and no step-up gate. Every constraint on the
+// agent was opt-in from the agent's own side.
+//
+// mTLS proves which process is calling and cannot be forged. Binding the actor
+// to that identity is what makes the constraint mandatory.
+func TestAgentWorkloadCannotActAsTheApplication(t *testing.T) {
+	env := newEnv(t)
+	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted}}
+	p := env.pipeline(c)
+
+	// The agent's workload, presenting the *user's* application token.
+	got := p.Check(context.Background(),
+		env.agentReq("GET", "/api/profile/alice", env.token(t, "alice", "smarthome-app")))
+
+	if got.Outcome == Permit {
+		t.Fatal("the agent workload acted as the application, bypassing delegation entirely")
+	}
+	if got.Reason != logx.ReasonActorNotBound {
+		t.Errorf("reason = %q, want %q", got.Reason, logx.ReasonActorNotBound)
+	}
+	if c.lastCount != 0 {
+		t.Errorf("SpiceDB was consulted %d times; the binding should refuse before asking", c.lastCount)
+	}
+}
+
+// TestAgentTokenIsOnlyAcceptedFromItsOwnWorkload — the same binding, the other
+// way round. A leaked agent token replayed from some other process is refused,
+// because the token names the agent but the mesh names the caller.
+func TestAgentTokenIsOnlyAcceptedFromItsOwnWorkload(t *testing.T) {
+	env := newEnv(t)
+	c := &countingChecker{outcomes: []spicedb.Outcome{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted}}
+	p := env.pipeline(c)
+
+	got := p.Check(context.Background(), env.withSource(
+		env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")),
+		"spiffe://cluster.local/ns/apps/sa/smarthome-service"))
+
+	if got.Outcome == Permit {
+		t.Fatal("an agent token was accepted from a workload it is not bound to")
+	}
+	if got.Reason != logx.ReasonActorNotBound {
+		t.Errorf("reason = %q, want %q", got.Reason, logx.ReasonActorNotBound)
+	}
+}
+
+// TestBoundWorkloadStillWorks — the positive control, so the two tests above
+// cannot pass by refusing the agent everywhere.
+func TestBoundWorkloadStillWorks(t *testing.T) {
+	env := newEnv(t)
+	p := env.pipeline(fixedChecker{spicedb.Permitted, spicedb.Permitted, spicedb.Permitted})
+
+	got := p.Check(context.Background(),
+		env.agentReq("GET", "/api/profile/alice", env.agentToken(t, "alice")))
+	if got.Outcome != Permit {
+		t.Fatalf("outcome = %v (reason %q), want Permit", got.Outcome, got.Reason)
 	}
 }

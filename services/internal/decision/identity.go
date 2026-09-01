@@ -44,7 +44,7 @@ type identity struct {
 
 // identify runs steps 2 and 3. A non-nil Response means the pipeline stops
 // here: either the browser is being sent to Keycloak, or the caller is denied.
-func (p *Pipeline) identify(ctx context.Context, req Request, rule *config.Rule, matched bool, d *logx.Decision) (identity, *Response) {
+func (p *Pipeline) identify(ctx context.Context, cfg *config.Config, req Request, rule *config.Rule, matched bool, d *logx.Decision) (identity, *Response) {
 	authMode := config.AuthModeEither
 	if matched {
 		authMode = rule.AuthMode
@@ -57,7 +57,7 @@ func (p *Pipeline) identify(ctx context.Context, req Request, rule *config.Rule,
 			return identity{}, &Response{Outcome: Deny, Status: 401, Reason: logx.ReasonTokenInvalid,
 				Body: denyBody(logx.ReasonTokenInvalid, "the presented token is not valid")}
 		}
-		id, resp := p.fromClaims(claims, raw)
+		id, resp := fromClaims(cfg, claims, raw)
 		if resp != nil {
 			return identity{}, resp
 		}
@@ -69,25 +69,25 @@ func (p *Pipeline) identify(ctx context.Context, req Request, rule *config.Rule,
 			Body: denyBody(logx.ReasonNoSession, "this endpoint requires a bearer token")}
 	}
 
-	sid := cookieValue(req.header("cookie"), p.cfg.Cookie.Name)
+	sid := cookieValue(req.header("cookie"), cfg.Cookie.Name)
 	if sid == "" {
-		return identity{}, p.startLogin(ctx, req, d)
+		return identity{}, p.startLogin(ctx, cfg, req, d)
 	}
 
 	sess, err := p.sessions.Get(ctx, sid)
 	if err != nil {
 		// A session store failure and a missing session are the same thing
 		// here: the session cannot be verified, so it does not exist.
-		return identity{}, p.startLogin(ctx, req, d)
+		return identity{}, p.startLogin(ctx, cfg, req, d)
 	}
 	if !sess.Authenticated {
-		return identity{}, p.startLogin(ctx, req, d)
+		return identity{}, p.startLogin(ctx, cfg, req, d)
 	}
 
 	if time.Now().After(sess.ExpiresAt.Add(-15 * time.Second)) {
-		app, ok := p.cfg.AppByName(sess.Application)
+		app, ok := cfg.AppByName(sess.Application)
 		if !ok {
-			return identity{}, p.startLogin(ctx, req, d)
+			return identity{}, p.startLogin(ctx, cfg, req, d)
 		}
 		tok, rerr := p.oidc.Refresh(ctx, app.Name, app.ClientSecret, sess.RefreshToken)
 		if rerr != nil {
@@ -95,14 +95,14 @@ func (p *Pipeline) identify(ctx context.Context, req Request, rule *config.Rule,
 			// valid. Restart authentication — never continue as authenticated.
 			logx.Error("token refresh failed; restarting authentication", "err", rerr.Error())
 			_ = p.sessions.Delete(ctx, sid)
-			return identity{}, p.startLogin(ctx, req, d)
+			return identity{}, p.startLogin(ctx, cfg, req, d)
 		}
 		sess.AccessToken = tok.AccessToken
 		if tok.RefreshToken != "" {
 			sess.RefreshToken = tok.RefreshToken
 		}
 		sess.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
-		if err := p.sessions.Put(ctx, sess, p.cfg.Cookie.TTL); err != nil {
+		if err := p.sessions.Put(ctx, sess, cfg.Cookie.TTL); err != nil {
 			return identity{}, &Response{Outcome: Deny, Status: 403, Reason: logx.ReasonInternalError,
 				Body: denyBody(logx.ReasonInternalError, "session could not be persisted")}
 		}
@@ -112,9 +112,9 @@ func (p *Pipeline) identify(ctx context.Context, req Request, rule *config.Rule,
 	if err != nil {
 		logx.Error("session access token failed validation", "err", err.Error())
 		_ = p.sessions.Delete(ctx, sid)
-		return identity{}, p.startLogin(ctx, req, d)
+		return identity{}, p.startLogin(ctx, cfg, req, d)
 	}
-	id, resp := p.fromClaims(claims, sess.AccessToken)
+	id, resp := fromClaims(cfg, claims, sess.AccessToken)
 	if resp != nil {
 		return identity{}, resp
 	}
@@ -123,11 +123,11 @@ func (p *Pipeline) identify(ctx context.Context, req Request, rule *config.Rule,
 
 // fromClaims turns validated claims into a principal, an application and — when
 // the token came out of an RFC 8693 exchange — an agent.
-func (p *Pipeline) fromClaims(c *oidcauth.Claims, raw string) (identity, *Response) {
+func fromClaims(cfg *config.Config, c *oidcauth.Claims, raw string) (identity, *Response) {
 	// An agent's token has `sub` = the human and `azp` = the agent. Nothing
 	// else distinguishes it from the human's own token, which is precisely why
 	// the agent registry is configuration rather than inference.
-	if ag, ok := p.cfg.AgentByClient(c.AuthorizedParty); ok {
+	if ag, ok := cfg.AgentByClient(c.AuthorizedParty); ok {
 		return identity{
 			kind:        kindAgent,
 			subjectType: "gerege/user",
@@ -144,7 +144,7 @@ func (p *Pipeline) fromClaims(c *oidcauth.Claims, raw string) (identity, *Respon
 	// sniffing the token, because "is this a device" is a deployment fact.
 	// mvp_docs/02 §4.4: no user, no consent — the device acts on its own
 	// relationships.
-	if spID, ok := p.cfg.SystemPrincipals[c.AuthorizedParty]; ok {
+	if spID, ok := cfg.SystemPrincipals[c.AuthorizedParty]; ok {
 		return identity{
 			kind:        kindSystem,
 			subjectType: "gerege/system_principal",
@@ -154,7 +154,7 @@ func (p *Pipeline) fromClaims(c *oidcauth.Claims, raw string) (identity, *Respon
 			accessToken: raw,
 		}, nil
 	}
-	if _, ok := p.cfg.AppByName(c.AuthorizedParty); !ok {
+	if _, ok := cfg.AppByName(c.AuthorizedParty); !ok {
 		// An application the authorizer has never heard of cannot have a
 		// consent grant, so there is nothing to evaluate. Deny rather than
 		// treat it as first-party.
@@ -179,8 +179,8 @@ func (p *Pipeline) fromClaims(c *oidcauth.Claims, raw string) (identity, *Respon
 // fetch/XHR client that follows a 302 to Keycloak's HTML login page learns
 // nothing useful, and a redirect loop on /favicon.ico is a classic way to lose
 // an afternoon.
-func (p *Pipeline) startLogin(ctx context.Context, req Request, d *logx.Decision) *Response {
-	app, ok := p.cfg.AppForHost(req.Host)
+func (p *Pipeline) startLogin(ctx context.Context, cfg *config.Config, req Request, d *logx.Decision) *Response {
+	app, ok := cfg.AppForHost(req.Host)
 	if !ok || !wantsHTML(req) {
 		return &Response{Outcome: Deny, Status: 401, Reason: logx.ReasonNoSession,
 			Body: denyBody(logx.ReasonNoSession, "authentication required")}
@@ -205,7 +205,7 @@ func (p *Pipeline) startLogin(ctx context.Context, req Request, d *logx.Decision
 		CodeVerifier: pk.Verifier,
 		ReturnTo:     externalURL(req),
 	}
-	if err := p.sessions.New(ctx, pending, p.cfg.Cookie.PendTTL); err != nil {
+	if err := p.sessions.New(ctx, pending, cfg.Cookie.PendTTL); err != nil {
 		logx.Error("cannot persist pending session", "err", err.Error())
 		return &Response{Outcome: Deny, Status: 403, Reason: logx.ReasonInternalError,
 			Body: denyBody(logx.ReasonInternalError, "login could not be started")}
@@ -216,11 +216,11 @@ func (p *Pipeline) startLogin(ctx context.Context, req Request, d *logx.Decision
 		Status:    http.StatusFound,
 		Reason:    logx.ReasonRedirectToLogin,
 		Location:  p.oidc.AuthorizationURL(app.Name, redirectURI(req), state, nonce, pk),
-		SetCookie: p.cookie(sid, p.cfg.Cookie.PendTTL),
+		SetCookie: cookie(cfg, sid, cfg.Cookie.PendTTL),
 	}
 }
 
-func (p *Pipeline) handleCallback(ctx context.Context, req Request, d *logx.Decision) Response {
+func (p *Pipeline) handleCallback(ctx context.Context, cfg *config.Config, req Request, d *logx.Decision) Response {
 	q := queryValues(req.Path)
 	code, state := q.Get("code"), q.Get("state")
 	if e := q.Get("error"); e != "" {
@@ -228,7 +228,7 @@ func (p *Pipeline) handleCallback(ctx context.Context, req Request, d *logx.Deci
 			Body: denyBody(logx.ReasonTokenInvalid, "identity provider returned "+e)}
 	}
 
-	sid := cookieValue(req.header("cookie"), p.cfg.Cookie.Name)
+	sid := cookieValue(req.header("cookie"), cfg.Cookie.Name)
 	if sid == "" || code == "" || state == "" {
 		return Response{Outcome: Deny, Status: 400, Reason: logx.ReasonTokenInvalid,
 			Body: denyBody(logx.ReasonTokenInvalid, "malformed callback")}
@@ -245,7 +245,7 @@ func (p *Pipeline) handleCallback(ctx context.Context, req Request, d *logx.Deci
 		return Response{Outcome: Deny, Status: 400, Reason: logx.ReasonTokenInvalid,
 			Body: denyBody(logx.ReasonTokenInvalid, "state mismatch")}
 	}
-	app, ok := p.cfg.AppByName(sess.Application)
+	app, ok := cfg.AppByName(sess.Application)
 	if !ok {
 		return Response{Outcome: Deny, Status: 403, Reason: logx.ReasonUnknownApplication,
 			Body: denyBody(logx.ReasonUnknownApplication, "unknown application")}
@@ -295,7 +295,7 @@ func (p *Pipeline) handleCallback(ctx context.Context, req Request, d *logx.Deci
 		Subject:       claims.Subject,
 		DisplayName:   claims.Display(),
 	}
-	if err := p.sessions.Put(ctx, authed, p.cfg.Cookie.TTL); err != nil {
+	if err := p.sessions.Put(ctx, authed, cfg.Cookie.TTL); err != nil {
 		return Response{Outcome: Deny, Status: 403, Reason: logx.ReasonInternalError,
 			Body: denyBody(logx.ReasonInternalError, "session could not be persisted")}
 	}
@@ -307,13 +307,13 @@ func (p *Pipeline) handleCallback(ctx context.Context, req Request, d *logx.Deci
 		Status:    http.StatusFound,
 		Reason:    "authenticated",
 		Location:  returnTo,
-		SetCookie: p.cookie(newID, p.cfg.Cookie.TTL),
+		SetCookie: cookie(cfg, newID, cfg.Cookie.TTL),
 	}
 }
 
-func (p *Pipeline) handleLogout(ctx context.Context, req Request, d *logx.Decision) Response {
+func (p *Pipeline) handleLogout(ctx context.Context, cfg *config.Config, req Request, d *logx.Decision) Response {
 	var idToken string
-	if sid := cookieValue(req.header("cookie"), p.cfg.Cookie.Name); sid != "" {
+	if sid := cookieValue(req.header("cookie"), cfg.Cookie.Name); sid != "" {
 		if sess, err := p.sessions.Get(ctx, sid); err == nil {
 			idToken = sess.IDToken
 			d.Principal = sess.Subject
@@ -330,19 +330,19 @@ func (p *Pipeline) handleLogout(ctx context.Context, req Request, d *logx.Decisi
 		Status:    http.StatusFound,
 		Reason:    "logged_out",
 		Location:  p.oidc.LogoutURL(idToken, home),
-		SetCookie: p.cfg.Cookie.Name + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+		SetCookie: cfg.Cookie.Name + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
 	}
 }
 
-func (p *Pipeline) cookie(id string, ttl time.Duration) string {
+func cookie(cfg *config.Config, id string, ttl time.Duration) string {
 	parts := []string{
-		fmt.Sprintf("%s=%s", p.cfg.Cookie.Name, id),
+		fmt.Sprintf("%s=%s", cfg.Cookie.Name, id),
 		"Path=/",
 		"HttpOnly",
 		"SameSite=Lax",
 		fmt.Sprintf("Max-Age=%d", int(ttl.Seconds())),
 	}
-	if p.cfg.Cookie.Secure {
+	if cfg.Cookie.Secure {
 		parts = append(parts, "Secure")
 	}
 	return strings.Join(parts, "; ")

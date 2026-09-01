@@ -102,6 +102,9 @@ step "9. External authorizer"
 k -n id create configmap ext-authz-config \
   --from-file=config.yaml="$ROOT/services/config/ext-authz.yaml" \
   --dry-run=client -o yaml | k apply -f - >/dev/null
+k -n id create configmap gerege-catalogue \
+  --from-file=catalogue.yaml="$ROOT/services/config/catalogue.yaml" \
+  --dry-run=client -o yaml | k apply -f - >/dev/null
 k apply -f "$ROOT/deploy/40-ext-authz.yaml" >/dev/null
 k -n id rollout restart deploy/ext-authz >/dev/null 2>&1 || true
 wait_rollout id deploy/ext-authz

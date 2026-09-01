@@ -7,7 +7,9 @@ SpiceDB.
 
 Extended beyond that scope with **agent identity**: a delegated actor that holds a user's
 token and is still bound by what the user delegated, for as long as the delegation lasts
-([docs/agent-identity.md](docs/agent-identity.md)).
+([docs/agent-identity.md](docs/agent-identity.md)) — and with a **lifecycle** for the
+non-human identities that act for people, none of which exists without a named owner
+([docs/lifecycle.md](docs/lifecycle.md)).
 
 Runs on one machine, on Kubernetes. Everything is drivable from a terminal; the
 demonstration applications are also usable in a browser.
@@ -15,7 +17,8 @@ demonstration applications are also usable in a browser.
 ```bash
 sudo make hosts     # once — five hostnames pointing at loopback
 make up             # kind cluster, Istio, Keycloak, SpiceDB, seven services
-make verify         # 29 assertions, unattended
+make verify         # 39 assertions, unattended
+make inventory      # who answers for every non-human identity
 make demo           # the five scenarios, one keypress at a time
 ```
 
@@ -189,6 +192,10 @@ make inspect             # look inside SpiceDB: schema, facts, who is authorized
 make verify              # 22 assertions across all eight claims
 make demo                # all scenarios;  make demo S="2 3b 5"  for the short set
 make demo S=6            # the agent
+make demo S=7            # onboarding and offboarding a device
+make inventory           # every non-human identity and its operator; fails if any is unowned
+make onboard-device NAME=sensor-2 OPERATOR=alice     # four systems, one command
+make offboard-device NAME=sensor-2                   # relationships first — instant kill
 make decisions           # the authorization decision log, one line per decision
 ./scripts/decisions.sh -f  # follow it live
 make sensor              # the IoT device: one request allowed, three refused, each cycle
@@ -230,6 +237,7 @@ mvp/
 ├── keycloak/realm-gerege.json  users, clients, no authorization state
 ├── services/
 │   ├── config/ext-authz.yaml   the authorization map: path → resource, permission, capability
+│   ├── config/catalogue.yaml   what each capability means to a person; sensitivity
 │   ├── cmd/agent-runner/       the agent: RFC 8693 exchange, then act
 │   ├── internal/decision/      the pipeline, and failclosed_test.go
 │   ├── internal/routes/        specificity-ordered matching; ambiguity is a startup error
@@ -250,10 +258,11 @@ Request → Envoy sidecar → ext-authz (gRPC)
    ├─ 2. principal    bearer token, or session cookie → access token
    ├─ 3. application  token `azp`         │  workload  source.principal (mTLS)
    ├─ 4. match a route rule               no match → DENY
-   ├─ 5. is this workload registered?     not registered → DENY
+   ├─ 4. is the workload bound to the actor it presents?   no → DENY
+   ├─ 5. is this workload registered for this route?      no → DENY
    ├─ 6. step-up gate                     sensitive capability → a human must be present
-   ├─ 7. CheckBulkPermissions [permission, consent? delegation?]
-   └─ 8. emit a decision record
+   ├─ 7. CheckBulkPermissions [permission, consent? enrolment? delegation?]
+   └─ 8. emit a decision record — principal AND actor
 ```
 
 Keycloak is not on this path. SpiceDB is the only authorization backend. Every failure
@@ -265,7 +274,7 @@ The three identities, and what each answers:
 |---|---|---|
 | **Principal** | Session or bearer token `sub` | Whose data, and who is accountable |
 | **Application** | Token `azp` | Who the user consented to |
-| **Agent** | Token `azp`, after an RFC 8693 exchange | What is acting, and under what delegation |
+| **Agent** | Token `azp`, after an RFC 8693 exchange | What is acting, under what delegation, and for whom it is enrolled |
 | **Workload** | `source.principal` from mTLS | Which process is calling |
 
 Permission is checked against the principal. Consent is checked against the
@@ -293,6 +302,10 @@ disagreed with them, it is recorded in
   from `azp` — sufficient for one hop, and the reason the MVP has exactly one agent.
 - Delegation replaces consent for agents rather than adding to it; each actor kind gets
   one binding grant.
+- Ownership is enforced in three different places, because "is this owned", "may it act
+  for this user" and "may this person switch it off" are three different questions.
+- The workload identity mTLS proves now constrains the actor the token merely claims —
+  without that binding, the agent's own process could opt out of every constraint on it.
 
 ---
 

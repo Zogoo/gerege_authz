@@ -346,6 +346,8 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["/app/account-app"]
           env:
+            - name: CATALOGUE_PATH
+              value: /etc/gerege/catalogue.yaml
             - name: SPICEDB_ENDPOINT
               value: spicedb.id.svc.cluster.local:50051
             - name: SPICEDB_INSECURE
@@ -366,3 +368,13 @@ spec:
             periodSeconds: 5
           resources:
             requests: { cpu: 50m, memory: 96Mi }
+          volumeMounts:
+            - name: catalogue
+              mountPath: /etc/gerege
+              readOnly: true
+      volumes:
+        # The wording a person reads before granting access is policy, not code.
+        # Onboarding an agent changes this file, not a binary.
+        - name: catalogue
+          configMap:
+            name: gerege-catalogue

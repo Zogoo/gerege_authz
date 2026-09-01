@@ -83,6 +83,9 @@ func main() {
 	r.section("C9  Agent identity, delegation and step-up")
 	agents(r)
 
+	r.section("C10  Lifecycle — onboarding and offboarding")
+	lifecycle(r)
+
 	r.section("C8  Fail closed")
 	failClosed(r)
 
@@ -439,6 +442,61 @@ func agents(r *runner) {
 	r.check("A19", "withdrawing the delegation stops the agent on the next call",
 		!anyPermitted, fmt.Sprintf("steps_permitted=%v", anyPermitted))
 
+	// A21 — ownership. Nothing non-human acts unowned.
+	for _, o := range []struct{ typ, id, label string }{
+		{"gerege/system_principal", "sensor-1", "the device"},
+		{"gerege/agent", "assistant", "the agent"},
+	} {
+		owned, err := r.spice.Operates(ctx, o.typ, o.id, "alice")
+		r.check("A21/"+o.id, "accountability: "+o.label+" has a named operator",
+			err == nil && owned, fmt.Sprintf("administrate@alice=%v err=%v", owned, err))
+	}
+	r.note("docs/09 §4 rule 2 — accountability is a relationship, not a spreadsheet")
+
+	notOperator, err := r.spice.Operates(ctx, "gerege/agent", "assistant", "bob")
+	r.check("A21b", "only the operator administers — Bob does not",
+		err == nil && !notOperator, fmt.Sprintf("administrate@bob=%v", notOperator))
+
+	// A22 — enrolment. Being delegated something is not the same as being
+	// allowed to act for the person at all.
+	if _, err := r.spice.Delegate(ctx, "alice", "assistant", []string{"profile_read"}, 10*time.Minute); err != nil {
+		r.fail("A22", "delegate a capability", err.Error())
+		return
+	}
+	if err := r.remove("gerege/agent", "assistant", "enrolled_for", "gerege/user", "alice"); err != nil {
+		r.fail("A22", "withdraw the agent's enrolment", err.Error())
+		return
+	}
+	t, _, _ = askAgent("read-profile", alice)
+	_, unenrolledWhy, _ := t.step("profile_read")
+	r.check("A22", "withdrawing enrolment stops the agent even though the delegation stands",
+		unenrolledWhy == "agent_not_enrolled",
+		fmt.Sprintf("reason=%s", or(unenrolledWhy)))
+	r.note("a delegation names a user and an agent; enrolment is what says that pairing was intended")
+
+	if err := r.write("gerege/agent", "assistant", "enrolled_for", "gerege/user", "alice"); err != nil {
+		r.fail("A22b", "restore the enrolment", err.Error())
+		return
+	}
+	t, _, _ = askAgent("read-profile", alice)
+	restored, _, _ := t.step("profile_read")
+	r.check("A22b", "enrolment restored → the agent acts again", restored,
+		fmt.Sprintf("permitted=%v", restored))
+	_ = r.spice.Undelegate(ctx, "alice", "assistant")
+
+	// A23 — the binding between workload and actor.
+	//
+	// Run from inside the agent's own pod, because that is the only place the
+	// attack exists: agent-runner is handed Alice's application token in order
+	// to exchange it, and could simply forward it instead — becoming the
+	// application, with consent-scoped access and no delegation check at all.
+	status, reason = execInAgentPod(*kubectx, alice,
+		"http://device-service.apps.svc.cluster.local/internal/devices/lock-1/unlock")
+	r.check("A23", "the agent's workload cannot act as the application whose token it holds",
+		status == 403 && reason == "actor_not_bound",
+		fmt.Sprintf("status=%d reason=%s", status, or(reason)))
+	r.note("mTLS proves the process; the token only claims the actor. Binding them makes the constraint mandatory")
+
 	// A20 — the audience gate. A token minted for an application that never
 	// named this agent cannot be turned into agent authority.
 	viaProfile := mustToken(r, "profile-app", "profile-app-secret", "alice", "alice")
@@ -447,6 +505,65 @@ func agents(r *runner) {
 		status != 200 || strings.Contains(body, "exchange refused"),
 		fmt.Sprintf("status=%d", status))
 	r.note("Keycloak refuses to mint agent authority from a token issued for something else")
+}
+
+// ---------------------------------------------------------------------------
+// C10 — lifecycle
+// ---------------------------------------------------------------------------
+
+// lifecycle onboards a device, proves it works, decommissions it, and proves a
+// token captured beforehand is dead.
+//
+// It drives the same script a person would run, rather than reimplementing it,
+// because the thing being asserted is that *the command* works — a test that
+// rebuilds the steps in Go would keep passing after the script broke.
+func lifecycle(r *runner) {
+	const dev = "sensor-verify"
+	_, _ = runLifecycle("offboard-device", dev) // leave no trace of a previous run
+
+	if _, err := clientCredentials(dev, dev+"-secret"); err == nil {
+		r.fail("A24", "the device does not exist before onboarding", "it already had a client")
+		return
+	}
+
+	if out, err := runLifecycle("onboard-device", dev, "alice", "alice-home"); err != nil {
+		r.fail("A24", "one command registers a device across four systems", truncate(out, 300))
+		return
+	}
+	tok, err := clientCredentials(dev, dev+"-secret")
+	r.check("A24", "one command registers a device across four systems",
+		err == nil && tok != "", fmt.Sprintf("obtained a token: %v", err == nil))
+
+	status, reason, _ := apiPostBody("http://"+deviceHost+"/telemetry/"+dev, tok, `{"temperature":19.7}`)
+	own := status == 202 || status == 200
+	other, otherReason, _ := apiPostBody("http://"+deviceHost+"/telemetry/sensor-1", tok, `{"temperature":19.7}`)
+	r.check("A24b", "the new device may push its own telemetry and nobody else's",
+		own && other == 403,
+		fmt.Sprintf("own=%d(%s) other=%d(%s)", status, or(reason), other, or(otherReason)))
+	r.note("onboarding grants one relationship — a device is not a skeleton key the moment it is born")
+
+	owned, err := r.spice.Operates(context.Background(), "gerege/system_principal", dev, "alice")
+	r.check("A24c", "the device is recorded as owned by the person who onboarded it",
+		err == nil && owned, fmt.Sprintf("administrate@alice=%v", owned))
+
+	// Capture a token that is still valid, then take the device away.
+	doomed, _ := clientCredentials(dev, dev+"-secret")
+	if out, err := runLifecycle("offboard-device", dev); err != nil {
+		r.fail("A25", "decommissioning kills a still-valid token", truncate(out, 300))
+		return
+	}
+	status, reason, _ = apiPostBody("http://"+deviceHost+"/telemetry/"+dev, doomed, `{"temperature":19.7}`)
+	r.check("A25", "a token captured before decommissioning is refused on the next request",
+		doomed != "" && status == 403,
+		fmt.Sprintf("status=%d reason=%s", status, or(reason)))
+	r.note("nothing waited for the token to expire, and nothing had to reach the device")
+}
+
+func runLifecycle(args ...string) (string, error) {
+	cmd := exec.Command("./scripts/lifecycle.sh", args...)
+	cmd.Dir = ".."
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +617,41 @@ func failClosed(r *runner) {
 	if sawBackendDown {
 		r.note("denials carried reason backend_unavailable — the authorizer knew why it could not decide")
 	}
+}
+
+// execInAgentPod makes a request from inside the agent's own pod, which is the
+// only vantage point from which the workload-to-actor binding can be tested:
+// the source principal has to be the agent's, and nothing outside the mesh can
+// present that identity.
+func execInAgentPod(kubectx, token, url string) (int, string) {
+	pod, err := exec.Command("kubectl", "--context", kubectx, "-n", "apps",
+		"get", "pod", "-l", "app=agent-runner",
+		"-o", "jsonpath={.items[0].metadata.name}").Output()
+	if err != nil || len(pod) == 0 {
+		return 0, "no_agent_pod"
+	}
+	out, err := exec.Command("kubectl", "--context", kubectx, "-n", "apps",
+		"exec", string(pod), "-c", "app", "--",
+		"curl", "-s", "-o", "/dev/null", "-D", "-", "-X", "POST",
+		"-H", "accept: application/json",
+		"-H", "authorization: Bearer "+token, url).Output()
+	if err != nil {
+		return 0, "exec_failed"
+	}
+	status, reason := 0, ""
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if strings.HasPrefix(line, "HTTP/") {
+			fields := strings.Fields(line)
+			if len(fields) > 1 {
+				fmt.Sscanf(fields[1], "%d", &status)
+			}
+		}
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(k, "x-authz-reason") {
+			reason = strings.TrimSpace(v)
+		}
+	}
+	return status, reason
 }
 
 func scaleSpiceDB(replicas int) error {
@@ -884,10 +1036,13 @@ func (r *runner) report() int {
 	fmt.Println("  independent enforcement on internal calls, non-human identity, and")
 	fmt.Println("  fail-closed behaviour under backend failure.")
 	fmt.Println()
-	fmt.Println("  And one claim the original scope did not have: an agent holding the")
-	fmt.Println("  user's own token, with the user's own consent, does only what it was")
-	fmt.Println("  delegated — for as long as the delegation lasts, and never through a")
-	fmt.Println("  route that requires a person to be present.")
+	fmt.Println("  And three the original scope did not have. An agent holding the user's")
+	fmt.Println("  own token, with the user's own consent, does only what it was delegated —")
+	fmt.Println("  for as long as the delegation lasts, and never through a route that")
+	fmt.Println("  requires a person to be present. The process running that agent can only")
+	fmt.Println("  ever act as that agent, because the identity mTLS proves constrains the")
+	fmt.Println("  one the token merely claims. And nothing non-human acts unowned: every")
+	fmt.Println("  agent and every device answers to a named person.")
 	return 0
 }
 

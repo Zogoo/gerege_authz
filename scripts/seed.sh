@@ -17,9 +17,37 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 ZED_LOCAL="${ZED_LOCAL:-localhost:50051}"
-ZED=(zed --endpoint "$ZED_LOCAL" --token gerege-mvp-key --insecure)
+ZED=(zed --endpoint "$ZED_LOCAL" --token gerege-mvp-key --insecure --skip-version-check)
+
+# retire_removed_relations deletes relationships belonging to relations that the
+# schema no longer declares.
+#
+# SpiceDB refuses to remove a relation while relationships exist under it, and
+# that is the right behaviour: a schema change that silently dropped data would
+# be an authorization change nobody reviewed. So a rename is a two-step
+# operation, and the steps are listed here rather than discovered when a
+# bootstrap fails.
+#
+# Format: "<definition> <relation>   # why it went away"
+RETIRED_RELATIONS=(
+  "gerege/agent controller"   # split into `operator` (accountability) and
+                              # `enrolled_for` (which users it may act for)
+)
+
+retire_removed_relations() {
+  local entry definition relation
+  for entry in "${RETIRED_RELATIONS[@]}"; do
+    definition=$(echo "$entry" | awk '{print $1}')
+    relation=$(echo "$entry" | awk '{print $2}')
+    if "${ZED[@]}" relationship read "$definition" 2>/dev/null | grep -q " $relation "; then
+      "${ZED[@]}" relationship bulk-delete "$definition" "$relation" --force >/dev/null 2>&1 || true
+      ok "retired $definition#$relation"
+    fi
+  done
+}
 
 seed_schema() {
+  retire_removed_relations
   "${ZED[@]}" schema write "$ROOT/spicedb/schema.zed" >/dev/null \
     || die "could not write the permission schema"
   ok "schema applied"
@@ -57,10 +85,17 @@ verify_seed() {
     "true|gerege/device:thermostat-1 operate gerege/user:alice" \
     "true|gerege/device:sensor-1 push_telemetry gerege/system_principal:sensor-1" \
     "false|gerege/device:thermostat-1 push_telemetry gerege/system_principal:sensor-1" \
+    "true|gerege/system_principal:sensor-1 administrate gerege/user:alice" \
+    "true|gerege/agent:assistant administrate gerege/user:alice" \
+    "true|gerege/agent:assistant act_for gerege/user:alice" \
+    "false|gerege/agent:assistant act_for gerege/user:bob" \
     "false|gerege/consent_grant:alice|smarthome-app includes gerege/capability:profile_read"
   do
     want="${probe%%|*}"; expr="${probe#*|}"
-    got=$("${ZED[@]}" permission check ${expr} 2>&1 | tr -d '\r')
+    # stdout only, last line only: zed writes operational notices to stderr, and
+    # folding those into the compared value turns an upstream release into a
+    # bootstrap failure.
+    got=$("${ZED[@]}" permission check --consistency-full ${expr} 2>/dev/null | tr -d '\r' | tail -1)
     if [[ "$got" == "$want" ]]; then
       ok "$expr → $got"
     else

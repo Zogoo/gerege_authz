@@ -34,11 +34,19 @@ relationships: |-
   gerege/device:lock-1#home@gerege/home:alice-home
   gerege/device:sensor-1#home@gerege/home:alice-home
 
-  // --- the agent ----------------------------------------------------------
-  // The agent exists and Alice controls it. That is all. It holds no
-  // capabilities until she delegates some, and every delegation expires —
-  // so, like consent, none is seeded. Scenario 6 starts from a refusal.
-  gerege/agent:assistant#controller@gerege/user:alice
+  // --- accountability: nothing non-human acts unowned ----------------------
+  // docs/09 §4 rule 2. The operator answers for what the thing does and is the
+  // only one who may decommission it. `make inventory` fails if any non-human
+  // identity is missing this.
+  gerege/system_principal:sensor-1#operator@gerege/user:alice
+  gerege/agent:assistant#operator@gerege/user:alice
+
+  // The agent is enrolled to act for Alice, and for nobody else. Enrolment is
+  // durable and says which users this agent may act for at all; a delegation is
+  // per-task and says what it may do for them. Both are required.
+  gerege/agent:assistant#enrolled_for@gerege/user:alice
+
+  // Still no delegation and no consent: Scenario 6 starts from a refusal.
 
   // --- the device's own identity ------------------------------------------
   // This single relationship is the whole of sensor-1's authority. It may

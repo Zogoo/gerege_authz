@@ -17,6 +17,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"net"
@@ -38,7 +40,6 @@ import (
 	"github.com/gerege/idp-mvp/internal/extauthz"
 	"github.com/gerege/idp-mvp/internal/logx"
 	"github.com/gerege/idp-mvp/internal/oidcauth"
-	"github.com/gerege/idp-mvp/internal/routes"
 	"github.com/gerege/idp-mvp/internal/session"
 	"github.com/gerege/idp-mvp/internal/spicedb"
 )
@@ -50,6 +51,7 @@ func main() {
 		healthAddr  = flag.String("health-addr", envOr("HEALTH_ADDR", ":9002"), "health listen address (not mesh-intercepted)")
 		debugAddr   = flag.String("debug-addr", envOr("DEBUG_ADDR", ":9003"), "decision-log listen address")
 		consentBase = flag.String("consent-base", envOr("CONSENT_BASE_URL", "http://account.local.test"), "external base URL of the account console")
+		reloadEvery = flag.Duration("reload-interval", 15*time.Second, "how often to re-read the route configuration")
 	)
 	flag.Parse()
 
@@ -60,7 +62,7 @@ func main() {
 		logx.Error("refusing to start: configuration is not usable", "err", err.Error())
 		os.Exit(1)
 	}
-	table, err := routes.Compile(cfg.Rules)
+	snapshot, err := decision.NewSnapshot(cfg)
 	if err != nil {
 		logx.Error("refusing to start: route table is not usable", "err", err.Error())
 		os.Exit(1)
@@ -95,7 +97,12 @@ func main() {
 	}
 	defer perms.Close()
 
-	pipeline := decision.New(cfg, table, provider, session.NewMemoryStore(), perms, *consentBase)
+	pipeline := decision.New(snapshot, provider, session.NewMemoryStore(), perms, *consentBase)
+
+	// Registries change when a device or an agent is onboarded. Reloading them
+	// in place means enrolling a sensor does not require restarting the one
+	// component every request in the mesh depends on.
+	go watchConfig(*configPath, *reloadEvery, pipeline)
 
 	grpcServer := grpc.NewServer()
 	authv3.RegisterAuthorizationServer(grpcServer, extauthz.New(pipeline))
@@ -113,6 +120,8 @@ func main() {
 	logx.Info("ext-authz ready",
 		"grpc", *grpcAddr,
 		"rules", len(cfg.Rules),
+		"agents", len(cfg.Agents),
+		"reload_interval", reloadEvery.String(),
 		"applications", len(cfg.Applications),
 		"issuer", cfg.Issuer.External,
 		"spicedb", cfg.SpiceDB.Endpoint,
@@ -131,6 +140,63 @@ func main() {
 		logx.Error("grpc server stopped", "err", err.Error())
 		os.Exit(1)
 	}
+}
+
+// watchConfig re-reads the configuration and swaps it in when it changes.
+//
+// Two rules make this safe to run against a live authorizer:
+//
+//   - a configuration that fails to load or compile is *not* installed. The
+//     previous one keeps serving. A bad edit must not be able to take the
+//     authorizer down, and it must not be able to open it either.
+//   - the swap is atomic and a request reads the snapshot once, so a reload
+//     never applies halfway through a decision.
+//
+// Polling rather than inotify because a ConfigMap update replaces a symlink
+// rather than writing the file, which is exactly the case filesystem watchers
+// are worst at.
+func watchConfig(path string, every time.Duration, p *decision.Pipeline) {
+	last, err := fingerprint(path)
+	if err != nil {
+		logx.Error("cannot fingerprint config; reload disabled", "err", err.Error())
+		return
+	}
+	for range time.Tick(every) {
+		current, err := fingerprint(path)
+		if err != nil || current == last {
+			continue
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			logx.Error("configuration changed but is not usable — keeping the previous one",
+				"err", err.Error())
+			last = current
+			continue
+		}
+		snap, err := decision.NewSnapshot(cfg)
+		if err != nil {
+			logx.Error("route table changed but is not usable — keeping the previous one",
+				"err", err.Error())
+			last = current
+			continue
+		}
+		p.Swap(snap)
+		last = current
+		logx.Info("configuration reloaded",
+			"rules", snap.Rules(),
+			"applications", len(cfg.Applications),
+			"agents", len(cfg.Agents),
+			"system_principals", len(cfg.SystemPrincipals))
+	}
+}
+
+func fingerprint(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func waitForIssuer(p *oidcauth.Provider, budget time.Duration) error {

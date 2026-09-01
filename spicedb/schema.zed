@@ -32,8 +32,22 @@ definition gerege/user {}
 /** An OAuth client a user can consent to — `profile-app`, `smarthome-app`. */
 definition gerege/application {}
 
-/** A non-human caller, e.g. `sensor-1`. Has an accountable human operator. */
-definition gerege/system_principal {}
+/**
+ * A non-human caller — a sensor, a reconciler, a cron job.
+ *
+ * docs/09 §4 rule 2: "Every system principal has a named human operator.
+ * Accountability is a relationship, not a spreadsheet."
+ *
+ * The operator is who answers for what this thing does and who may decommission
+ * it. An unowned non-human identity is the thing that becomes ungoverned, so
+ * onboarding refuses to create one and `make inventory` fails if one appears.
+ */
+definition gerege/system_principal {
+	/** the accountable human operator */
+	relation operator: gerege/user
+
+	permission administrate = operator
+}
 
 /**
  * A named thing an application may be granted.
@@ -122,10 +136,30 @@ definition gerege/device {
  * pass exactly as if the user had made the call themselves.
  */
 definition gerege/agent {
-	/** the human this agent acts for */
-	relation controller: gerege/user
+	/**
+	 * The accountable human operator — who answers for what this agent does,
+	 * and the only one who may decommission it. Same rule as a device
+	 * (docs/09 §4): accountability is a relationship.
+	 */
+	relation operator: gerege/user
 
-	permission act = controller
+	/**
+	 * The users this agent has been enrolled to act for.
+	 *
+	 * Separate from `operator` because the two are different questions. A
+	 * platform assistant may be operated by one team and enrolled for thousands
+	 * of customers; the operator is answerable for it, the enrolled users are
+	 * the ones it may act for.
+	 *
+	 * This is checked on every agent request. Without it, an agent enrolled for
+	 * Alice could be handed Bob's token and would act for Bob — the delegation
+	 * check alone would not catch it, because a delegation names a user and an
+	 * agent but says nothing about whether that pairing was ever intended.
+	 */
+	relation enrolled_for: gerege/user
+
+	permission administrate = operator
+	permission act_for = enrolled_for
 }
 
 /**

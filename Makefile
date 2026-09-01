@@ -15,7 +15,8 @@ K         := kubectl --context $(KCTX)
 
 .DEFAULT_GOAL := help
 .PHONY: help prereqs hosts unhosts up down reset build load verify demo test schema-test config-test \
-        decisions logs sensor status shell-zed reseed open diagram inspect diagram
+        decisions logs sensor status shell-zed reseed open diagram \
+        onboard-device offboard-device onboard-agent enrol-agent offboard-agent inventory inspect diagram
 
 ## ---------------------------------------------------------------------------
 ## Setup
@@ -61,6 +62,28 @@ build: ## rebuild the service image and load it into the cluster
 
 reseed: ## reset the demo world — re-apply the schema and seed relationships
 	@./scripts/reseed.sh
+
+## ---------------------------------------------------------------------------
+## Lifecycle — onboarding and offboarding non-human identities
+## ---------------------------------------------------------------------------
+
+onboard-device: ## register an IoT device: NAME=sensor-2 OPERATOR=alice [HOME=alice-home]
+	@./scripts/lifecycle.sh onboard-device "$(NAME)" "$(OPERATOR)" "$(HOME_ID)"
+
+offboard-device: ## decommission a device: NAME=sensor-2
+	@./scripts/lifecycle.sh offboard-device "$(NAME)"
+
+onboard-agent: ## register an agent: NAME=helper OPERATOR=alice [CLIENT=...] [WORKLOAD=spiffe://...]
+	@./scripts/lifecycle.sh onboard-agent "$(NAME)" "$(OPERATOR)" "$(CLIENT)" "$(WORKLOAD)"
+
+enrol-agent: ## let an agent act for a user: NAME=helper USER=alice
+	@./scripts/lifecycle.sh enrol-agent "$(NAME)" "$(USER)"
+
+offboard-agent: ## decommission an agent: NAME=helper
+	@./scripts/lifecycle.sh offboard-agent "$(NAME)"
+
+inventory: ## list every non-human identity and its operator; fails if any is unowned
+	@./scripts/lifecycle.sh inventory
 
 ## ---------------------------------------------------------------------------
 ## Demonstrate
@@ -113,8 +136,8 @@ test: schema-test config-test ## run every offline test
 schema-test: ## run the SpiceDB schema assertion suite
 	cd spicedb && zed validate validation.yaml
 
-config-test: ## validate the route configuration and print the match table
-	cd services && go run ./cmd/configcheck config/ext-authz.yaml
+config-test: ## validate route config + catalogue, and check they agree
+	cd services && go run ./cmd/configcheck config/ext-authz.yaml config/catalogue.yaml
 
 
 diagram: ## regenerate docs/architecture.svg and .png
