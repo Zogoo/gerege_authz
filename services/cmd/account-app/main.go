@@ -157,17 +157,20 @@ remember to remove them, which is what stops a task grant from quietly becoming 
 		sort.Slice(owned, func(i, j int) bool { return owned[i].ID < owned[j].ID })
 		ownBody.WriteString(`<table><tr><th>Identity</th><th>Kind</th><th></th></tr>`)
 		for _, o := range owned {
-			kind, name := "device", displayAgent(o.ID)
+			kind, name := "device", o.ID
 			if o.Type == "gerege/agent" {
-				kind = "agent"
-			} else {
-				name = o.ID
+				kind, name = "agent", displayAgent(o.ID)
 			}
-			fmt.Fprintf(&ownBody, `<tr><td>%s <span class="tag">%s</span></td><td>%s</td>
+			// Only show the object id when it adds something the name does not.
+			label := webui.Esc(name)
+			if !strings.EqualFold(name, o.ID) {
+				label += ` <span class="tag">` + webui.Esc(o.ID) + `</span>`
+			}
+			fmt.Fprintf(&ownBody, `<tr><td>%s</td><td>%s</td>
 <td><form method="post" action="/decommission">
 <input type="hidden" name="type" value="%s"><input type="hidden" name="id" value="%s">
 <button class="danger">Decommission</button></form></td></tr>`,
-				webui.Esc(name), webui.Esc(o.ID), kind, webui.Esc(o.Type), webui.Esc(o.ID))
+				label, kind, webui.Esc(o.Type), webui.Esc(o.ID))
 		}
 		ownBody.WriteString(`</table>`)
 	}

@@ -148,7 +148,7 @@ captured while the device is alive, and that token refused the moment the device
 is decommissioned.
 
 It also says what it does **not** show, which is the part worth reading — see
-[§8](#8-what-is-still-missing).
+[§9](#9-what-is-still-missing).
 
 Assertions A24–A25 run the same cycle unattended, by driving this script rather
 than reimplementing it: the thing being asserted is that *the command* works, and
@@ -156,7 +156,164 @@ a test that rebuilt the steps in Go would keep passing after the script broke.
 
 ---
 
-## 6. Inventory
+## 6. Doing it by hand
+
+`make onboard-device` exists so nobody has to do this. It is written out here
+because a command whose steps you cannot see is a command you cannot audit, and
+because onboarding a device on a system that is not this one means doing exactly
+these four things somewhere else.
+
+Every command below has been run verbatim.
+
+### Before anything
+
+```bash
+kubectl config use-context kind-gerege-idp
+```
+
+The single most common way to waste ten minutes here is running these against
+whatever cluster `kubectl` was already pointed at, and getting
+`namespaces "id" not found` from step 3.
+
+These also assume the demo hostnames resolve (`sudo make hosts`). Without them,
+add `--resolve id.local.test:80:127.0.0.1` to each `curl`.
+
+```bash
+DEVICE=sensor-2
+OWNER=alice
+HOME_ID=alice-home
+KC=http://id.local.test
+```
+
+### 1. An identity — Keycloak
+
+```bash
+ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
+  -d grant_type=password -d client_id=admin-cli \
+  -d username=admin -d password=admin | jq -r .access_token)
+
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST \
+  -H "authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  "$KC/admin/realms/gerege/clients" -d '{
+    "clientId": "'"$DEVICE"'",
+    "name": "'"$DEVICE"' (IoT device identity)",
+    "enabled": true,
+    "protocol": "openid-connect",
+    "publicClient": false,
+    "secret": "'"$DEVICE"'-secret",
+    "standardFlowEnabled": false,
+    "directAccessGrantsEnabled": false,
+    "serviceAccountsEnabled": true,
+    "redirectUris": [], "webOrigins": []
+  }'
+```
+
+`serviceAccountsEnabled` with every browser flow off is what makes this a device
+rather than an application: it can obtain a token for itself with
+`client_credentials`, and it can do nothing else.
+
+### 2. A kind — the authorizer's registry
+
+```bash
+kubectl -n id get configmap ext-authz-config \
+  -o jsonpath='{.data.config\.yaml}' > /tmp/ext-authz.yaml
+
+MARK=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sed -i '' "s|^systemPrincipals:|systemPrincipals:\n  $DEVICE: $DEVICE|" /tmp/ext-authz.yaml
+
+kubectl -n id create configmap ext-authz-config \
+  --from-file=config.yaml=/tmp/ext-authz.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+This is what tells ext-authz that a token whose `azp` is `sensor-2` belongs to a
+non-human principal rather than an application — so consent is never evaluated
+and the subject becomes `gerege/system_principal:sensor-2`.
+
+Wait for the authorizer to pick it up. **It does not restart:**
+
+```bash
+kubectl -n id logs deploy/ext-authz --since-time="$MARK" -f | grep "configuration reloaded"
+```
+
+Note `--since-time`. Grepping recent logs without it will match a *previous*
+reload and tell you the change is live before it is.
+
+### 3. Authority and an owner — SpiceDB
+
+```bash
+kubectl -n id port-forward svc/spicedb 50051:50051 &
+sleep 3
+alias zedc='zed --endpoint localhost:50051 --token gerege-mvp-key --insecure'
+
+zedc relationship touch gerege/system_principal:$DEVICE operator gerege/user:$OWNER
+zedc relationship touch gerege/device:$DEVICE          home     gerege/home:$HOME_ID
+zedc relationship touch gerege/device:$DEVICE          self     gerege/system_principal:$DEVICE
+```
+
+The **first** line is the one that matters most and the one easiest to skip. A
+device without an operator is an identity nobody answers for — `make inventory`
+exists to fail when that happens.
+
+The other two are the whole of its authority: it belongs to a home, and it is
+itself. `push_telemetry` derives from `self`, so it may report its own readings
+and nothing else.
+
+### 4. Verify, rather than assume
+
+```bash
+zedc permission check --consistency-full gerege/device:$DEVICE push_telemetry gerege/system_principal:$DEVICE   # true
+zedc permission check --consistency-full gerege/system_principal:$DEVICE administrate gerege/user:$OWNER        # true
+zedc permission check --consistency-full gerege/device:sensor-1 push_telemetry gerege/system_principal:$DEVICE  # false
+```
+
+`--consistency-full` is not optional here. A check immediately after a write must
+read its own write, and the default consistency reads at a quantized revision —
+so a freshly written relationship is briefly invisible and a correct onboarding
+reports as a failure.
+
+Then prove it end to end:
+
+```bash
+TOKEN=$(curl -s -X POST "$KC/realms/gerege/protocol/openid-connect/token" \
+  -d grant_type=client_credentials \
+  -d "client_id=$DEVICE" -d "client_secret=$DEVICE-secret" | jq -r .access_token)
+
+curl -s -o /dev/null -w 'own telemetry:      HTTP %{http_code}\n' \
+  -X POST http://device.local.test/telemetry/$DEVICE \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"temperature":21.0}'
+
+curl -s -o /dev/null -w 'someone elses:      HTTP %{http_code}\n' \
+  -X POST http://device.local.test/telemetry/sensor-1 \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"temperature":21.0}'
+```
+
+```
+own telemetry:      HTTP 202
+someone elses:      HTTP 403
+```
+
+### Taking it away
+
+Reverse order, and **relationships first** — that is the kill switch:
+
+```bash
+zedc relationship bulk-delete gerege/device:$DEVICE --force
+zedc relationship bulk-delete gerege/system_principal:$DEVICE --force
+
+# now it is powerless. the rest is tidying.
+UUID=$(curl -s -H "authorization: Bearer $ADMIN" \
+  "$KC/admin/realms/gerege/clients?clientId=$DEVICE" | jq -r '.[0].id')
+curl -s -X PUT -H "authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  "$KC/admin/realms/gerege/clients/$UUID" -d '{"enabled":false}'
+```
+
+A token issued seconds earlier, still correctly signed and minutes from expiry,
+stops working on the very next request.
+
+---
+
+## 7. Inventory
 
 ```bash
 make inventory
@@ -178,7 +335,7 @@ when?*
 
 ---
 
-## 7. Why onboarding does not restart the authorizer
+## 8. Why onboarding does not restart the authorizer
 
 Registry changes used to require restarting ext-authz — the one component every
 request in the mesh depends on. With a single replica that is a brief total
@@ -200,7 +357,7 @@ symlink rather than writing the file — precisely the case watchers handle wors
 
 ---
 
-## 8. What is still missing
+## 9. What is still missing
 
 **The claiming ceremony.** Onboarding is operator-driven: someone with Keycloak
 admin credentials runs a command and *asserts* that Alice owns the device. A
